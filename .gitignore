@@ -1,6 +1,2 @@
-# Compiled and build artifacts
-*.pyc
 __pycache__/
-
-# Temp files
-*.bak
+*.pyc
