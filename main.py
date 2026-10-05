@@ -2,27 +2,38 @@
 """
 Визуальный клиент (GUI) для игры "mergeCards" на PyQt5.
 
-Игровая логика — mergeCards/API.py (класс Game). GUI ничего не «чинит»
-в движке, но корректно его использует:
+Игровая логика — mergeCards/API.py (класс Game). GUI использует движок
+как есть, но честно сообщает игроку исход каждого хода до его совершения.
 
-Управление мышью:
-    - клик по ЛЮБОЙ карте       — выбрать её как источник; переносится
-      выбранная карта и ВСЁ, что под ней (это ограничение движка);
-    - drag (зажать и тащить)   — взять верхнюю карту стопки (или всю
-      стопку целиком, если схватили за её тело) и бросить в колонку;
-    - Ctrl+колесо / Up / Down   — выбрать карту НИЖЕ/ВЫШЕ в стопке,
-      т.е. переносить не всю колонку, а только часть («определённые карты»);
-    - Shift+клик                — сразу перенести ВЕСЬ столбец в цель;
-    - стрелки Left / Right      — выбор цели для переноса с клавиатуры;
+Как устроен движок (важно для понимания правил):
+    - y = 0 — верхний ряд поля; новые строки появляются СВЕРХУ и сдвигают
+      все карты вниз; карты, упавшие за нижний край (y >= size[1]), — смерть;
+    - перенос забирает выбранную карту и ВСЁ, что ниже неё в колонке, и
+      кладёт пачку СНИЗУ (под нижнюю карту) колонки-цели;
+    - после переноса, если слияний не было, движок сам добавляет новую
+      строку; если после этого нет ни одной пары одинаковых карт на всём
+      поле — он продолжает добавлять строки, пока поле не умрёт.
+      Поэтому «бессмысленный» ход может кончиться прямо в Game Over.
+
+Управление мышью (перенести МОЖНО любой «срез» колонки — карту и всё под
+ней, а не обязательно весь столбец):
+    - клик по карте             — выбрать именно эту карту (верх среза);
+    - клик по другой колонке    — перенести выбранный срез туда;
+    - drag (зажать и тащить)   — то же одним жестом;
+    - ↑ / ↓ или колесо мыши     — двигать верхнюю границу среза по стопке
+      (т.е. выбирать, сколько карт снизу колонки перенести);
+    - Shift+клик                — выбрать ВЕСЬ столбец;
+    - ← / →                     — с клавиатуры: перенести срез в соседнюю
+      колонку (если выбор уже сделан), иначе — выбрать колонку;
     - Пробел                    — добавить строку сверху (add_row);
     - Z                         — отменить последний ход;
     - R                         — новая игра;  Esc — выход.
 
-Смерть (Game Over) наступает ТОЛЬКО когда не осталось ни одного хода
-ни у переносов, ни у кнопки «+ Строка». Ходы, которые сами по себе
-заполняют поле, разрешены — после них можно спастись новой строкой
-(движок это позволяет), поэтому «застрять без возможности проиграть»
-невозможно.
+Честный проигрыш: перед каждым ходом движок прогоняется на копии, и если
+ход ведёт к заполнению поля, игрок видит предупреждение («⚠ ход ведёт к
+Game Over») — подтвердить можно тем же действием ещё раз. Игра завершается
+либо когда движок сам объявил Game Over, либо когда не осталось ни одного
+хода «Success» и «+ Строка» тоже убивает поле.
 """
 
 import os
@@ -117,6 +128,7 @@ class BoardWidget(QWidget):
         self.drag_pos = None              # позиция курсора во время перетаскивания
         self.merge_flash = {}             # (x, y) -> оставшееся время вспышки, мс
         self.row_slide = 0.0              # прогресс анимации сдвига строки (0..1)
+        self.pending_confirm = None       # (sx, sy, dx, count) — ход ждёт подтверждения
 
         self._anim = QTimer(self)
         self._anim.setInterval(16)
@@ -125,6 +137,7 @@ class BoardWidget(QWidget):
         self.setMinimumSize(self.board_px_w(), self.board_px_h())
         self.setCursor(Qt.PointingHandCursor)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
 
     # --- размеры -----------------------------------------------------
     def board_px_w(self):
@@ -205,6 +218,17 @@ class BoardWidget(QWidget):
             yy += 1
         return cnt
 
+    def slice_count(self, x, y):
+        """Сколько карт уйдёт при выборе карты (x, y): она и всё под ней."""
+        cnt, yy = 0, y
+        while self.value_at(x, yy):
+            cnt += 1
+            yy += 1
+        return cnt
+
+    def stack_height(self, x):
+        return len(self.visible_cards(x))
+
     # --- проверка ходов через движок (на копиях!) ----------------------
     def _clone(self) -> Game:
         """Полноценный независимый клон игры.
@@ -284,13 +308,20 @@ class BoardWidget(QWidget):
         return cnt
 
     def add_row_survives(self):
-        """Выживет ли игра после «+ Строка» (проверяется на копии)."""
+        """Выживет ли игра после «+ Строка» (проверяется на копии).
+
+        Движок внутри add_row сам добрасывает строки, пока на поле есть
+        хотя бы одна пара одинаковых карт (_can_merge), и может выдать
+        Game Over уже в процессе. Клон полностью независим (свой _bag),
+        поэтому оригинал не портится."""
         try:
             gc = self._clone()
             res = gc.add_row()
         except Exception:
             return False
         if isinstance(res, tuple):
+            return False
+        if res is not None and str(res).startswith("Game Over"):
             return False
         return not any(gc.field[x][self.game.size[1]].value
                        for x in range(self.game.size[0]))
@@ -316,42 +347,99 @@ class BoardWidget(QWidget):
             return False
         if getattr(win, "game_over", False):
             return False
-        if src_x == dst_x:
-            self.selected = None
-            self.update()
-            return False
         if count_rows is None:
-            count_rows = self.selected_count() or 1
-        r = self._try_move(src_x, src_y, dst_x, count_rows)
-        if r is None:
+            count_rows = self.slice_count(src_x, src_y) or 1
+        if src_x == dst_x or count_rows <= 0:
             self.selected = None
-            win.show_status("Такой перенос движок не принимает.", warn=True)
+            self.pending_confirm = None
             self.update()
             return False
-        res, gc, added = r
+        gc_probe = self._clone()
+        try:
+            res_probe, added_probe = gc_probe.action_full(
+                (src_x, src_y), dst_x, count=count_rows)
+        except Exception:
+            res_probe, added_probe = "Invalid position", False
+        if isinstance(res_probe, tuple):
+            res_probe = str(res_probe[0])
+        if res_probe == "Invalid position":
+            self.selected = None
+            self.pending_confirm = None
+            win.show_status("Движок отвергает такой перенос "
+                            "(источник пуст или позиция недопустима).",
+                            warn=True)
+            self.update()
+            return False
+        if res_probe.startswith("Game Over"):
+            # Движок заранее говорит: этот перенос заполнит поле и это
+            # поражение. Не убиваем игрока молча — просим подтвердить
+            # то же действие ещё раз (или выбрать другой ход / Esc).
+            key = (src_x, src_y, dst_x, count_rows)
+            if self.pending_confirm != key:
+                self.pending_confirm = key
+                self.selected = (src_x, src_y)
+                win.show_status(
+                    f"⚠ Перенос {count_rows} карт из колонки {src_x + 1} в "
+                    f"колонку {dst_x + 1} приведёт к поражению! Повторите "
+                    "действие, чтобы согласиться, или Esc — отменить выбор.",
+                    warn=True)
+                self.update()
+                return False
+            # Поражение подтверждено вторым тем же действием: играем его
+            # на копии и переносим копию в оригинал — так поле гарантированно
+            # показывает финальное состояние движка без полуизменений.
+            self.pending_confirm = None
+            gc = gc_probe
+            win.push_undo()
+            self.game = gc
+            win.board_game_changed(self.game)
+            win.on_game_over(res_probe)
+            win.refresh_stats()
+            self._start_anim()
+            self.update()
+            return True
+        # Ход «Success» на копии — применяем его к оригиналу. Если движок
+        # при ходе НЕ добавлял новую строку, он детерминирован и результат
+        # в точности совпадает с движком без оболочки; если строку добавил,
+        # там есть randint — финальное состояние берём с проверенной копии,
+        # чтобы экран показывал ровно тот исход, который был предсказан.
         before = {(x, y, v) for x, y, v in self._all_values()}
         win.push_undo()
-        # применяем тот же ход к оригиналу (детерминированно, тем же путём)
+        # Применяем тот же ход к ЧИСТОМУ оригиналу. Если движок при этом
+        # сам объявил Game Over или упал (ранее мы это предсказали по
+        # детерминированной части) — просто берём финальное состояние
+        # проверенной копии: игрок видит ровно то, что ему обещали.
         try:
             real_res, real_added = self.game.action_full(
                 (src_x, src_y), dst_x, count=count_rows)
-        except Exception as exc:
-            win.pop_undo_discard()
-            self.selected = None
-            win.show_status(f"Ошибка хода: {exc}", warn=True)
-            return False
-        self.selected = None
+        except Exception:
+            real_res, real_added = "Game Over: engine exception", False
         if isinstance(real_res, tuple):
             real_res = str(real_res[0])
-        if real_res.startswith("Game Over"):
-            # ход заполнил поле — но это ЧЕСТНЫЙ проигрыш: до него у игрока
-            # всегда была альтернатива («+ Строка» или другой ход).
-            win.on_game_over(real_res)
-        elif real_res != "Success":
-            win.undo_last(reason="Ход отвергнут движком.")
+        if real_res != "Success":
+            self.game = gc_probe
+            win.board_game_changed(gc_probe)
+            added = added_probe
+        else:
+            added = real_added or added_probe
+            if added and added_probe:
+                # ход вызвал доброс строки (внутри randint) — сверяемся с
+                # копией только если оригинал и копия разошлись
+                same = (all(self.game.field[x][y].value == gc_probe.field[x][y].value
+                            for x in range(self.game.size[0])
+                            for y in range(self.game.size_calc[1]))
+                        and self.game.points == gc_probe.points)
+                if not same:
+                    self.game = gc_probe
+                    win.board_game_changed(gc_probe)
+        self.selected = None
+        if str(real_res).startswith("Game Over"):
+            # честный проигрыш: до него у игрока всегда была альтернатива
+            # («+ Строка» или другой ход).
+            win.on_game_over(str(real_res))
         else:
             self._detect_flashes(before)
-            if added or real_added:
+            if added:
                 self.row_slide = 1.0
             combo = max(self.game.lastCombo) if self.game.lastCombo else 0
             win.show_status(f"Комбо x{combo}!" if combo > 1 else
@@ -414,11 +502,13 @@ class BoardWidget(QWidget):
         x, y = self._cell_at(ev.pos())
         if x is None:
             self.selected = None
+            self.pending_confirm = None
             self.update()
             return
-        t = self.top_index(x)
+        vis = self.visible_cards(x)
         prev = self.selected          # выбор ДО этого нажатия
-        if t is None:
+        self.pending_confirm = None
+        if not vis:
             # клик по пустой колонке: если есть выбранный источник — переносим
             if prev is not None:
                 self.try_move(prev[0], prev[1], x, self.selected_count())
@@ -427,22 +517,28 @@ class BoardWidget(QWidget):
                 self.update()
             return
         if ev.modifiers() & Qt.ShiftModifier:
-            # Shift+ЛКМ: выбрать ВЕСЬ столбец (перенести все его карты)
-            self.selected = (x, t)
+            # Shift+ЛКМ: выбрать ВЕСЬ столбец (верх среза = верхняя карта)
+            if prev is not None and prev[0] != x:
+                self.try_move(prev[0], prev[1], x, self.selected_count())
+                return
+            self.selected = (x, vis[0])
             self.drag_all_column = True
             self.drag_from = None     # для всей колонки работает только клик-пара
+            self._announce_selection()
             self.update()
             return
         if prev is not None and prev[0] != x:
             # второй клик по ДРУГОЙ колонке = ход «источник -> эта колонка».
-            # куда именно целимся (верх/низ стопки) не важно: движок всегда
-            # кладёт пачку сверху на целевую колонку.
+            # куда именно целимся не важно: движок всегда кладёт пачку
+            # под нижнюю карту целевой колонки.
             self.try_move(prev[0], prev[1], x, self.selected_count())
             return
-        # выбираем конкретную карту (если попали по занятой) — переносится
-        # она и ВСЁ под ней; куда именно целимся (верх/низ стопки) не важно:
-        # движок всегда кладёт пачку СВЕРХУ на целевую колонку.
-        sy = y if self.value_at(x, y) else t
+        # выбираем конкретную карту — переносится она и ВСЁ под ней («срез»).
+        # если попали в пустую клетку занятой колонки — берём ближайшую снизу
+        sy = y if self.value_at(x, y) else None
+        if sy is None:
+            below = [v for v in vis if v >= y]
+            sy = below[0] if below else vis[-1]
         if prev is not None and prev[0] == x:
             # повторный клик по ТОЙ ЖЕ колонке-источнику НЕ должен случайно
             # превратиться в ход «в себя» — только меняем/снимаем выбор
@@ -454,13 +550,30 @@ class BoardWidget(QWidget):
                 self.drag_all_column = False
                 self.drag_from = (x, sy)
                 self.drag_pos = QPointF(ev.pos())
+                self._announce_selection()
             self.update()
             return
         self.selected = (x, sy)
         self.drag_all_column = False
         self.drag_from = (x, sy)
         self.drag_pos = QPointF(ev.pos())
+        self._announce_selection()
         self.update()
+
+    def _announce_selection(self):
+        win = self.window()
+        if win is None or self.selected is None or win.is_game_over():
+            return
+        x, y = self.selected
+        h = self.stack_height(x)
+        cnt = self.slice_count(x, y)
+        if cnt >= h:
+            win.show_status(f"Выбрана колонка {x + 1}: весь столбец "
+                            f"({cnt} карт). Клик по другой колонке — перенести.")
+        else:
+            win.show_status(f"Выбран срез колонки {x + 1}: {cnt} НИЖНИХ карт "
+                            f"из {h}. ↑/↓ или колесо мыши — менять границу "
+                            "среда, клик по другой колонке — перенести.")
 
     def mouseMoveEvent(self, ev):
         self.hover_col = self._col_at(QPointF(ev.pos().x(), PAD + 1))
@@ -493,22 +606,23 @@ class BoardWidget(QWidget):
         self.try_move(frm[0], frm[1], tx, cnt)
 
     def wheelEvent(self, ev):
-        """Ctrl+колесо — сдвиг выбранной карты вверх/вниз по стопке."""
+        """Колесо мыши — двигать верхнюю границу выбранного «среза» по стопке."""
         if self.selected is None:
             return
         x, y = self.selected
-        t = self.top_index(x)
-        b = self.bottom_index(x)
-        if t is None:
+        vis = self.visible_cards(x)
+        if not vis:
             self.selected = None
             self.update()
             return
         dy = -1 if ev.angleDelta().y() > 0 else 1
-        ny = max(t, min(b, y + dy))
-        while ny != y and not self.value_at(x, ny):
-            ny += 1 if ny < y else -1
-        self.selected = (x, ny)
-        self.update()
+        ny = max(vis[0], min(vis[-1], y + dy))
+        if ny != y:
+            self.selected = (x, ny)
+            self.drag_from = (x, ny)
+            self.pending_confirm = None
+            self._announce_selection()
+            self.update()
 
     def leaveEvent(self, ev):
         self.hover_col = None
@@ -518,13 +632,21 @@ class BoardWidget(QWidget):
     def keyPressEvent(self, ev):
         key = ev.key()
         if key in (Qt.Key_Up, Qt.Key_Down) and self.selected:
-            # аналог Ctrl+колеса с клавиатуры
+            # сдвиг границы «среза» по стопке: Up — выше (больше карт),
+            # Down — ниже (меньше карт, только хвост колонки)
             x, y = self.selected
-            t, b = self.top_index(x), self.bottom_index(x)
+            vis = self.visible_cards(x)
+            if not vis:
+                self.selected = None
+                self.update()
+                return
             dy = -1 if key == Qt.Key_Up else 1
-            ny = max(t, min(b, y + dy))
-            self.selected = (x, ny)
-            self.update()
+            ny = max(vis[0], min(vis[-1], y + dy))
+            if ny != y:
+                self.selected = (x, ny)
+                self.pending_confirm = None
+                self._announce_selection()
+                self.update()
             return
         if key in (Qt.Key_Left, Qt.Key_Right):
             dx = -1 if key == Qt.Key_Left else 1
@@ -533,16 +655,18 @@ class BoardWidget(QWidget):
                 cur = self.hover_col if self.hover_col is not None else 0
                 for _ in range(cols):
                     cur = (cur + dx) % cols
-                    if self.top_index(cur) is not None:
+                    if self.visible_cards(cur):
                         break
-                if self.top_index(cur) is not None:
-                    self.selected = (cur, self.top_index(cur))
+                if self.visible_cards(cur):
+                    self.selected = (cur, self.visible_cards(cur)[-1])
+                    self._announce_selection()
             else:
                 sx, sy = self.selected
-                self.try_move(sx, sy, (sx + dx) % cols, self.selected_count())
+                self.try_move(sx, sy, (sx + dx) % cols, self.slice_count(sx, sy))
             self.update()
         elif key == Qt.Key_Escape:
             self.selected = None
+            self.pending_confirm = None
             self.update()
 
     # --- отрисовка -----------------------------------------------------
@@ -884,9 +1008,10 @@ class MainWindow(QMainWindow):
     def add_row_clicked(self):
         if self.game_over:
             return
-        # Сначала проверим исход на КОПИИ — чтобы исключение движка
-        # (KeyError при переполнении) не уронило приложение после получившегося
-        # частичного изменения поля.
+        # Движок при добавлении строки сам добрасывает новые строки, пока на
+        # поле есть хоть одна пара карт, и может в процессе объявить Game Over.
+        # Прогоняем действие на КОПИИ; оригинал меняем только если копия
+        # вернула чистый успех — так поле не останется полуизменённым.
         try:
             probe = self.clone_game(self.game)
             res = probe.add_row()
@@ -894,30 +1019,53 @@ class MainWindow(QMainWindow):
             self.on_game_over("поле переполнено — новую строку добавить некуда")
             self.refresh_stats()
             return
-        if isinstance(res, tuple) and str(res[0]).startswith("Game Over"):
-            self.on_game_over(str(res[0]))
+        bad = (isinstance(res, tuple) or
+               (res is not None and str(res).startswith("Game Over")) or
+               any(probe.field[x][probe.size[1]].value
+                   for x in range(probe.size[0])))
+        if bad:
+            # применяем финальное состояние копии (движок уже всё посчитал),
+            # чтобы игрок видел реальную картину, и объявляем поражение
+            self.push_undo()
+            self.game = probe
+            self.board.game = self.game
+            self.board.selected = None
+            self.board.row_slide = 1.0
+            self.board._start_anim()
+            self.on_game_over(str(res) if res is not None
+                              else "строка заполнила поле")
+            self.refresh_stats()
+            self.board.update()
             return
         self.push_undo()
-        try:
-            self.game.add_row()
-        except Exception:
-            self.undo_last(reason="Не удалось добавить строку.")
-            self.on_game_over("поле переполнено")
-            return
+        self.game = probe
+        self.board.game = self.game
         self.board.row_slide = 1.0
         self.board._start_anim()
         self.show_status("Добавлена новая строка сверху.")
         self.refresh_stats()
         self.check_deadlock()
+        self.board.update()
+
+    def board_game_changed(self, game: Game):
+        """BoardWidget подменил игру (например, после подтверждённого
+        проигрышного хода) — синхронизируем ссылку."""
+        self.game = game
+        self.board.game = game
 
     def on_game_over(self, reason: str):
         self.game_over = True
         self.show_status(f"Игра окончена ({reason}). «Отменить» (Z) вернёт последний ход, "
                          "«Новая игра» или R — начнёт заново.", warn=True)
 
+    def is_game_over(self):
+        return self.game_over
+
     def check_deadlock(self):
-        """Game Over только когда НЕТ ни одного принятого движком хода
-        И «+ Строка» тоже ведёт к заполнению поля."""
+        """Game Over, когда не осталось ни одного хода «Success» и «+ Строка»
+        тоже ведёт к заполнению поля. Ходы, которыми движок заранее объявляет
+        Game Over, поражением «автоматом» не считаются — они требуют
+        подтверждения игроком (см. BoardWidget.try_move)."""
         if self.game_over:
             return
         if not self.board.has_any_action():
