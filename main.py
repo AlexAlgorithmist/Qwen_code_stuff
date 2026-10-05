@@ -101,8 +101,6 @@ class BoardWidget(QWidget):
         self.game = game
         self.selected_col = None          # выбранная колонка-источник
         self.hover_col = None             # колонка под курсором
-        self.drag_col = None              # колонка, которую тащат мышью
-        self.drag_pos = QPointF()
         self.merge_flash = {}             # (x, y) -> оставшееся время вспышки, мс
         self.row_slide = 0.0              # прогресс анимации сдвига строки (0..1)
 
@@ -126,8 +124,9 @@ class BoardWidget(QWidget):
                       CELL, self.board_px_h() - 2 * PAD)
 
     def cell_center(self, x, y):
+        """Центр клетки (x, y) в координатах API: дно поля (y=0) — внизу виджета."""
         cx = PAD + x * (CELL + GAP) + CELL / 2
-        cy = PAD + y * (CELL + GAP) + CELL / 2
+        cy = PAD + (self.game.size[1] - 1 - y) * (CELL + GAP) + CELL / 2
         return QPointF(cx, cy)
 
     def _col_at(self, pos: QPointF):
@@ -139,7 +138,11 @@ class BoardWidget(QWidget):
 
     # --- игровые действия --------------------------------------------
     def column_stack(self, x):
-        """Список ярусов карт видимой стопки колонки x (снизу вверх)."""
+        """Список уровней карт стопки колонки x: индекс списка == координата y API.
+
+        В API дно поля — это y = 0, карты растут вверх (к большему y), а новые
+        строки появляются сверху и сдвигают всё вниз к дну.
+        """
         vals = []
         for y in range(self.game.size[1]):
             v = self.game.field[x][y].value
@@ -149,7 +152,11 @@ class BoardWidget(QWidget):
         return vals
 
     def top_index(self, x):
-        """Индекс верхней карты стопки (y) или None, если колонка пуста."""
+        """Координата y верхней карты стопки по API или None, если колонка пуста.
+
+        В API «верх» стопки — это БОЛЬШЕЕ y (карты растут вниз, новые строки
+        сдвигают всё вниз), поэтому берём последний ненулевой элемент стопки.
+        """
         stack = self.column_stack(x)
         return len(stack) - 1 if stack else None
 
@@ -300,21 +307,22 @@ class BoardWidget(QWidget):
                 p.setBrush(QColor(255, 255, 255, 18))
                 p.drawRoundedRect(r, 14, 14)
 
-        # danger-линия: верхний ряд заполнен
-        danger = any(self.game.field[x][0].value for x in range(self.game.size[0])) \
-            if self.game.size[1] > 0 else False
+        # danger-линия: верхний (видимый) ряд заполнен — приближается переполнение
+        top_row = self.game.size[1] - 1
+        danger = any(self.game.field[x][top_row].value
+                     for x in range(self.game.size[0]))
 
         # карты
         for x in range(self.game.size[0]):
             stack = self.column_stack(x)
             n = len(stack)
             for i, v in enumerate(stack):
-                # i=0 — низ стопки (y=n-1 рисуется внизу виджета)
-                y_vis = n - 1 - i
-                center = self.cell_center(x, y_vis)
+                # i=0 — дно стопки; рисуем по координатам API: y=i, дно внизу
+                center = self.cell_center(x, i)
                 slide_off = 0.0
-                if self.row_slide > 0 and i == 0:
-                    slide_off = -self.row_slide * (CELL + GAP) * 0.35
+                if self.row_slide > 0 and i == n - 1:
+                    # новая строка «входит» сверху вниз (к вершине стопки)
+                    slide_off = self.row_slide * (CELL + GAP) * 0.35
                 rect = QRectF(center.x() - CELL / 2,
                               center.y() - CELL / 2 + slide_off,
                               CELL, CELL)
@@ -322,14 +330,15 @@ class BoardWidget(QWidget):
                 if x == self.selected_col:
                     scale = 1.0 + 0.03 * (i + 1) / max(n, 1)
                 self._draw_card(p, rect, v, scale=scale,
-                                flash=self.merge_flash.get((x, n - 1 - i), 0))
+                                flash=self.merge_flash.get((x, i), 0))
 
         if danger:
             pen = QPen(QColor(239, 93, 93, 220))
             pen.setWidth(3)
             p.setPen(pen)
             p.setBrush(Qt.NoBrush)
-            line_y = PAD + CELL / 2 - 6
+            # линия над верхним (видимым) рядом — зона переполнения
+            line_y = PAD - 4
             p.drawLine(int(PAD), int(line_y),
                        int(self.board_px_w() - PAD), int(line_y))
 
