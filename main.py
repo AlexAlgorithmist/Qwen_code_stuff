@@ -170,25 +170,40 @@ class BoardWidget(QWidget):
                 return y
         return None
 
-    def has_legal_move(self):
-        """Есть ли хоть один корректный ход (для подсветки и антизависания)."""
+    def legal_moves(self):
+        """Список ходов (src, dst), которые движок точно примет без Game Over.
+
+        Проверка идёт на КОПИИ игры (action_full мутирует поле и может
+        вернуть 'Game Over', не откатывая состояние), поэтому оригинал
+        никогда не портится. Ход считается легальным, если копия отвечает
+        'Success' и при этом поле после хода остаётся в «живом» состоянии
+        (ни одна карта не вышла за нижний край поля).
+        """
+        moves = []
         if self.game_over_flag():
-            return False
+            return moves
+        bottom = self.game.size[1] - 1
         for src in range(self.game.size[0]):
             top = self.top_index(src)
             if top is None:
                 continue
-            gcopy = self.game.copy()
             for dst in range(self.game.size[0]):
                 if dst == src:
                     continue
                 try:
+                    gcopy = self.game.copy()
                     res, _ = gcopy.action_full((src, top), dst)
                 except Exception:
                     continue
-                if res == "Success":
-                    return True
-        return False
+                if res != "Success":
+                    continue
+                if any(gcopy.field[x][bottom].value for x in range(self.game.size[0])):
+                    continue  # ход привёл бы к переполнению — не предлагаем
+                moves.append((src, dst))
+        return moves
+
+    def has_legal_move(self):
+        return bool(self.legal_moves())
 
     def game_over_flag(self):
         win = self.window()
@@ -197,10 +212,8 @@ class BoardWidget(QWidget):
     def try_move(self, src: int, dst: int):
         """Выполняет ход «перенести всю стопку колонки src в колонку dst».
 
-        Ориентация API: y = 0 — верхний ряд (туда падает новая строка),
-        карты растут вниз; action_full((x, y), dst) забирает ВСЕ карты
-        колонки x начиная с ряда y и ниже. Поэтому posFrom[1] — это y
-        самой верхней карты стопки (top_index).
+        Перед вызовом движка ход проверяется на копии (legal_moves), чтобы
+        GUI никогда не уводил игру в нереверсивный Game Over из-за клика.
         """
         if src is None or dst is None or src == dst:
             self.selected_col = None
@@ -212,6 +225,12 @@ class BoardWidget(QWidget):
         top = self.top_index(src)
         if top is None:
             self.selected_col = None
+            self.update()
+            return False
+        if (src, dst) not in self.legal_moves():
+            self.selected_col = None
+            win.show_status("Такой ход приведёт к заполнению поля — выберите другую цель.",
+                            warn=True)
             self.update()
             return False
         before = {(x, y, v) for (x, y, v) in self._all_values()}
@@ -306,20 +325,21 @@ class BoardWidget(QWidget):
             self.update()
             return
         top = self.top_index(x)
-        if top is None:                       # клик по пустой колонке
-            self.selected_col = None
-            self.update()
-            return
-        if y != top:                          # клик не по верхней карте
-            self.hover_col = x
-            self.update()
-            return
-        if self.selected_col is None:
-            self.selected_col = x
-        elif self.selected_col == x:
-            self.selected_col = None          # отмена выбора
-        else:
+        if top is not None and abs(y - top) <= 1:
+            # клик по верхней карте (или впритык под ней — зона «схвата» стопки)
+            if self.selected_col is None:
+                self.selected_col = x
+            elif self.selected_col == x:
+                self.selected_col = None          # отмена выбора
+            else:
+                self.try_move(self.selected_col, x)
+        elif self.selected_col is not None and top is None:
+            # цель пуста — переносим стопку в пустую колонку целиком
             self.try_move(self.selected_col, x)
+        else:
+            # клик мимо верхней карты — просто снимаем выбор/подсвечиваем
+            self.selected_col = None
+            self.hover_col = x
         self.update()
 
     def mouseMoveEvent(self, ev):
@@ -336,12 +356,14 @@ class BoardWidget(QWidget):
             cols = self.game.size[0]
             if self.selected_col is None:
                 cur = self.hover_col if self.hover_col is not None else 0
-                self.selected_col = (cur + dx) % cols
-                if not self.column_stack(self.selected_col):
-                    self.selected_col = None
+                for _ in range(cols):
+                    cur = (cur + dx) % cols
+                    if self.column_stack(cur):
+                        break
+                if self.column_stack(cur):
+                    self.selected_col = cur
             else:
-                dst = (self.selected_col + dx) % cols
-                self.try_move(self.selected_col, dst)
+                self.try_move(self.selected_col, (self.selected_col + dx) % cols)
             self.update()
         elif ev.key() == Qt.Key_Escape:
             self.selected_col = None
@@ -586,8 +608,15 @@ class MainWindow(QMainWindow):
     def add_row_clicked(self):
         if self.game_over:
             return
-        # Game.add_row() возвращает None при успехе и ("Game Over...", True) при провале
-        res = self.game.add_row()
+        # Game.add_row() возвращает None при успехе и ("Game Over...", True) при провале.
+        # При нехватке места движок может бросить исключение — ловим его и
+        # корректно завершаем игру вместо падения приложения.
+        try:
+            res = self.game.add_row()
+        except Exception:
+            self.on_game_over("поле переполнено")
+            self.refresh_stats()
+            return
         if isinstance(res, tuple) and str(res[0]).startswith("Game Over"):
             self.on_game_over(res[0])
         else:
@@ -595,10 +624,18 @@ class MainWindow(QMainWindow):
             self.board._start_anim()
             self.show_status("Добавлена новая строка сверху.")
         self.refresh_stats()
+        self.check_deadlock()
 
     def on_game_over(self, reason: str):
         self.game_over = True
         self.show_status(f"Игра окончена ({reason}). Нажмите «Новая игра» или R.", warn=True)
+
+    def check_deadlock(self):
+        """Если ходов больше нет — корректно завершаем игру (без падения)."""
+        if self.game_over:
+            return
+        if not self.board.has_legal_move():
+            self.on_game_over("нет доступных ходов")
 
     def new_game(self):
         self.game = Game((BOARD_COLS, BOARD_ROWS), {})
