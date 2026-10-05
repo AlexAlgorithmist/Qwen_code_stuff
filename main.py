@@ -13,7 +13,9 @@
     - после переноса, если слияний не было, движок сам добавляет новую
       строку; если после этого нет ни одной пары одинаковых карт на всём
       поле — он продолжает добавлять строки, пока поле не умрёт.
-      Поэтому «бессмысленный» ход может кончиться прямо в Game Over.
+      Поэтому «бессмыслие» ходы реально могут кончиться прямо в Game Over;
+    - add_row НЕ вызывает merge() — это просто доброс строки + проверка
+      переполнения (как в голом API).
 
 Управление мышью (перенести МОЖНО любой «срез» колонки — карту и всё под
 ней, а не обязательно весь столбец):
@@ -29,11 +31,12 @@
     - Z                         — отменить последний ход;
     - R                         — новая игра;  Esc — выход.
 
-Честный проигрыш: перед каждым ходом движок прогоняется на копии, и если
-ход ведёт к заполнению поля, игрок видит предупреждение («⚠ ход ведёт к
-Game Over») — подтвердить можно тем же действием ещё раз. Игра завершается
-либо когда движок сам объявил Game Over, либо когда не осталось ни одного
-хода «Success» и «+ Строка» тоже убивает поле.
+Честный проигрыш: исход каждого хода предсказывается честным прогоном на
+независимой копии движка (тот же мешок случайных чисел, что и у оригинала).
+Если копия вернула «Game Over...», GUI применяет этот финальный ход к игре
+и объявляет поражение — ровно так, как это делает голый движок без всяких
+предупреждений-подтверждений. Игра завершается также, когда не осталось ни
+одного хода «Success» и «+ Строка» тоже убивает поле.
 """
 
 import os
@@ -308,7 +311,12 @@ class BoardWidget(QWidget):
         return cnt
 
     def add_row_survives(self):
-        """Выживет ли игра после «+ Строка» (проверяется на копии)."""
+        """Выживет ли игра после «+ Строка» (проверяется на копии).
+
+        Движок внутри add_row сам добрасывает строки, пока на поле есть
+        хотя бы одна пара одинаковых карт (_can_merge), и может выдать
+        Game Over уже в процессе. Клон полностью независим (свой _bag),
+        поэтому оригинал не портится."""
         try:
             gc = self._clone()
             res = gc.add_row()
@@ -316,15 +324,18 @@ class BoardWidget(QWidget):
             return False
         if isinstance(res, tuple):
             return False
+        if res is not None and str(res).startswith("Game Over"):
+            return False
         return not any(gc.field[x][self.game.size[1]].value
                        for x in range(self.game.size[0]))
 
     def has_any_action(self):
         if self.game_over_flag():
             return False
-        # Ходы, которые сами заканчивают игру («Game Over...»), действиями
-        # не считаются: иначе игра никогда не признает поражение.
-        if any(m[4] == "Success" for m in self.legal_moves()):
+        # Любое действие, которое движок ещё не запретил, — это ход: и
+        # «Success», и предсказанный «Game Over...» (последний честно
+        # завершает партию сразу при выполнении, см. try_move).
+        if self.legal_moves():
             return True
         return self.add_row_survives()
 
@@ -347,8 +358,15 @@ class BoardWidget(QWidget):
             self.pending_confirm = None
             self.update()
             return False
-        r = self._try_move(src_x, src_y, dst_x, count_rows)
-        if r is None:
+        gc_probe = self._clone()
+        try:
+            res_probe, added_probe = gc_probe.action_full(
+                (src_x, src_y), dst_x, count=count_rows)
+        except Exception:
+            res_probe, added_probe = "Invalid position", False
+        if isinstance(res_probe, tuple):
+            res_probe = str(res_probe[0])
+        if res_probe == "Invalid position":
             self.selected = None
             self.pending_confirm = None
             win.show_status("Движок отвергает такой перенос "
@@ -356,47 +374,62 @@ class BoardWidget(QWidget):
                             warn=True)
             self.update()
             return False
-        res_probe = str(r[0])
         if res_probe.startswith("Game Over"):
-            # Движок заранее говорит: этот перенос заполнит поле и это
-            # поражение. Не убиваем игрока молча — просим подтвердить
-            # то же действие ещё раз (или выбрать другой ход / Esc).
-            key = (src_x, src_y, dst_x, count_rows)
-            if self.pending_confirm != key:
-                self.pending_confirm = key
-                self.selected = (src_x, src_y)
-                win.show_status(
-                    f"⚠ Перенос {count_rows} карт из колонки {src_x + 1} в "
-                    f"колонку {dst_x + 1} приведёт к поражению! Повторите "
-                    "действие, чтобы согласиться, или Esc — отменить выбор.",
-                    warn=True)
-                self.update()
-                return False
+            # Голый движок на таком ходе просто возвращает "Game Over..." и
+            # оставляет поле в финальном состоянии. Делаем ровно то же:
+            # применяем результат прогона на копии и объявляем поражение —
+            # без «подтверждений», которые раньше делали игру непроигрываемой.
             self.pending_confirm = None
-        res, gc, added = r
+            win.push_undo()
+            self.game = gc_probe
+            win.board_game_changed(self.game)
+            win.on_game_over(res_probe)
+            win.refresh_stats()
+            self._start_anim()
+            self.update()
+            return True
+        # Ход «Success» на копии — применяем его к оригиналу. Если движок
+        # при ходе НЕ добавлял новую строку, он детерминирован и результат
+        # в точности совпадает с движком без оболочки; если строку добавил,
+        # там есть randint — финальное состояние берём с проверенной копии,
+        # чтобы экран показывал ровно тот исход, который был предсказан.
         before = {(x, y, v) for x, y, v in self._all_values()}
         win.push_undo()
-        # применяем тот же ход к оригиналу (детерминированно, тем же путём)
+        # Применяем тот же ход к ЧИСТОМУ оригиналу. Если движок при этом
+        # сам объявил Game Over или упал (ранее мы это предсказали по
+        # детерминированной части) — просто берём финальное состояние
+        # проверенной копии: игрок видит ровно то, что ему обещали.
         try:
             real_res, real_added = self.game.action_full(
                 (src_x, src_y), dst_x, count=count_rows)
-        except Exception as exc:
-            win.pop_undo_discard()
-            self.selected = None
-            win.show_status(f"Ошибка хода: {exc}", warn=True)
-            return False
-        self.selected = None
+        except Exception:
+            real_res, real_added = "Game Over: engine exception", False
         if isinstance(real_res, tuple):
             real_res = str(real_res[0])
-        if real_res.startswith("Game Over"):
-            # ход заполнил поле — но это ЧЕСТНЫЙ проигрыш: до него у игрока
-            # всегда была альтернатива («+ Строка» или другой ход).
-            win.on_game_over(real_res)
-        elif real_res != "Success":
-            win.undo_last(reason="Ход отвергнут движком.")
+        if real_res != "Success":
+            self.game = gc_probe
+            win.board_game_changed(gc_probe)
+            added = added_probe
+        else:
+            added = real_added or added_probe
+            if added and added_probe:
+                # ход вызвал доброс строки (внутри randint) — сверяемся с
+                # копией только если оригинал и копия разошлись
+                same = (all(self.game.field[x][y].value == gc_probe.field[x][y].value
+                            for x in range(self.game.size[0])
+                            for y in range(self.game.size_calc[1]))
+                        and self.game.points == gc_probe.points)
+                if not same:
+                    self.game = gc_probe
+                    win.board_game_changed(gc_probe)
+        self.selected = None
+        if str(real_res).startswith("Game Over"):
+            # честный проигрыш: до него у игрока всегда была альтернатива
+            # («+ Строка» или другой ход).
+            win.on_game_over(str(real_res))
         else:
             self._detect_flashes(before)
-            if added or real_added:
+            if added:
                 self.row_slide = 1.0
             combo = max(self.game.lastCombo) if self.game.lastCombo else 0
             win.show_status(f"Комбо x{combo}!" if combo > 1 else
@@ -965,9 +998,9 @@ class MainWindow(QMainWindow):
     def add_row_clicked(self):
         if self.game_over:
             return
-        # Сначала проверим исход на КОПИИ — чтобы исключение движка
-        # (KeyError при переполнении) не уронило приложение после получившегося
-        # частичного изменения поля.
+        # Исход доброса строки (движок внутри может добавить несколько строк
+        # и объявить Game Over) предсказываем прогоном на независимой копии;
+        # оригинал меняем только если копия вернула чистый успех.
         try:
             probe = self.clone_game(self.game)
             res = probe.add_row()
@@ -975,21 +1008,39 @@ class MainWindow(QMainWindow):
             self.on_game_over("поле переполнено — новую строку добавить некуда")
             self.refresh_stats()
             return
-        if isinstance(res, tuple) and str(res[0]).startswith("Game Over"):
-            self.on_game_over(str(res[0]))
+        bad = (isinstance(res, tuple) or
+               (res is not None and str(res).startswith("Game Over")) or
+               any(probe.field[x][probe.size[1]].value
+                   for x in range(probe.size[0])))
+        if bad:
+            # Как в голом движке: показываем финальное состояние и
+            # объявляем поражение сразу, без «подтверждений».
+            self.push_undo()
+            self.game = probe
+            self.board.game = self.game
+            self.board.selected = None
+            self.board.row_slide = 1.0
+            self.board._start_anim()
+            self.on_game_over(str(res) if res is not None
+                              else "строка заполнила поле")
+            self.refresh_stats()
+            self.board.update()
             return
         self.push_undo()
-        try:
-            self.game.add_row()
-        except Exception:
-            self.undo_last(reason="Не удалось добавить строку.")
-            self.on_game_over("поле переполнено")
-            return
+        self.game = probe
+        self.board.game = self.game
         self.board.row_slide = 1.0
         self.board._start_anim()
         self.show_status("Добавлена новая строка сверху.")
         self.refresh_stats()
         self.check_deadlock()
+        self.board.update()
+
+    def board_game_changed(self, game: Game):
+        """BoardWidget подменил игру (например, после подтверждённого
+        проигрышного хода) — синхронизируем ссылку."""
+        self.game = game
+        self.board.game = game
 
     def on_game_over(self, reason: str):
         self.game_over = True
