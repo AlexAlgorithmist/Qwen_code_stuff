@@ -1,6 +1,6 @@
 # Compiled and build artifacts
-__pycache__/
 *.pyc
+__pycache__/
 
-# Common compressed files
-*.tar.gz
+# Temp files
+*.bak
