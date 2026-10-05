@@ -101,6 +101,8 @@ class BoardWidget(QWidget):
         self.game = game
         self.selected_col = None          # выбранная колонка-источник
         self.hover_col = None             # колонка под курсором
+        self.drag_from = None             # колонка, от которой начали перетаскивание
+        self.drag_pos = None              # позиция курсора во время перетаскивания
         self.merge_flash = {}             # (x, y) -> оставшееся время вспышки, мс
         self.row_slide = 0.0              # прогресс анимации сдвига строки (0..1)
 
@@ -124,9 +126,14 @@ class BoardWidget(QWidget):
                       CELL, self.board_px_h() - 2 * PAD)
 
     def cell_center(self, x, y):
-        """Центр клетки (x, y) в координатах API: дно поля (y=0) — внизу виджета."""
+        """Центр клетки (x, y) в координатах API.
+
+        В API y = 0 — это ВЕРХНИЙ видимый ряд: именно туда движок добавляет
+        новые строки (_addrow сдвигает все карты вниз, к большему y).
+        Значит на экране row_экрана == y_api (без инверсии).
+        """
         cx = PAD + x * (CELL + GAP) + CELL / 2
-        cy = PAD + (self.game.size[1] - 1 - y) * (CELL + GAP) + CELL / 2
+        cy = PAD + y * (CELL + GAP) + CELL / 2
         return QPointF(cx, cy)
 
     def _col_at(self, pos: QPointF):
@@ -138,29 +145,63 @@ class BoardWidget(QWidget):
 
     # --- игровые действия --------------------------------------------
     def column_stack(self, x):
-        """Список уровней карт стопки колонки x: индекс списка == координата y API.
+        """Уровни карт колонки x сверху вниз; индекс списка == координата y API.
 
-        В API дно поля — это y = 0, карты растут вверх (к большему y), а новые
-        строки появляются сверху и сдвигают всё вниз к дну.
+        В API y = 0 — верхний видимый ряд: новые строки появляются именно
+        сверху (_addrow сдвигает всё вниз), а «дно» колодца — это y = size[1]-1.
+        Карты в колонке лежат подряд от какого-то y до дна.
         """
         vals = []
-        for y in range(self.game.size[1]):
+        for y in range(self.game.size_calc[1]):
             v = self.game.field[x][y].value
-            if v == 0:
-                break
-            vals.append(v)
+            if v:
+                vals.append(v)
         return vals
 
     def top_index(self, x):
-        """Координата y верхней карты стопки по API или None, если колонка пуста.
+        """Координата y САМОЙ ВЕРХНЕЙ карты колонки (или None если пуста).
 
-        В API «верх» стопки — это БОЛЬШЕЕ y (карты растут вниз, новые строки
-        сдвигают всё вниз), поэтому берём последний ненулевой элемент стопки.
+        action_full((x, y), dst) забирает из колонки x ВСЕ карты начиная с
+        ряда y и ниже (y .. size[1]-1). Чтобы перенести всю стопку целиком,
+        нужно передать y самой верхней занятой клетки.
         """
-        stack = self.column_stack(x)
-        return len(stack) - 1 if stack else None
+        for y in range(self.game.size_calc[1]):
+            if self.game.field[x][y].value:
+                return y
+        return None
+
+    def has_legal_move(self):
+        """Есть ли хоть один корректный ход (для подсветки и антизависания)."""
+        if self.game_over_flag():
+            return False
+        for src in range(self.game.size[0]):
+            top = self.top_index(src)
+            if top is None:
+                continue
+            gcopy = self.game.copy()
+            for dst in range(self.game.size[0]):
+                if dst == src:
+                    continue
+                try:
+                    res, _ = gcopy.action_full((src, top), dst)
+                except Exception:
+                    continue
+                if res == "Success":
+                    return True
+        return False
+
+    def game_over_flag(self):
+        win = self.window()
+        return bool(win is not None and getattr(win, "game_over", False))
 
     def try_move(self, src: int, dst: int):
+        """Выполняет ход «перенести всю стопку колонки src в колонку dst».
+
+        Ориентация API: y = 0 — верхний ряд (туда падает новая строка),
+        карты растут вниз; action_full((x, y), dst) забирает ВСЕ карты
+        колонки x начиная с ряда y и ниже. Поэтому posFrom[1] — это y
+        самой верхней карты стопки (top_index).
+        """
         if src is None or dst is None or src == dst:
             self.selected_col = None
             self.update()
@@ -174,12 +215,17 @@ class BoardWidget(QWidget):
             self.update()
             return False
         before = {(x, y, v) for (x, y, v) in self._all_values()}
-        res, added = self.game.action_full((src, top), dst)
+        try:
+            res, added = self.game.action_full((src, top), dst)
+        except Exception as exc:  # движок не должен падать, но подстрахуемся
+            self.selected_col = None
+            win.show_status(f"Ошибка хода: {exc}", warn=True)
+            return False
         self.selected_col = None
         if isinstance(res, str) and res.startswith("Game Over"):
             win.on_game_over(res)
         elif res != "Success":
-            win.show_status("Нельзя так ходить!", warn=True)
+            win.show_status("Нельзя так ходить! (стопка не помещается)", warn=True)
         else:
             self._detect_flashes(before)
             if added:
@@ -190,6 +236,7 @@ class BoardWidget(QWidget):
                 msg = f"Комбо x{combo}!"
             win.show_status(msg)
         win.refresh_stats()
+        win.check_deadlock()
         self._start_anim()
         self.update()
         return True
@@ -230,22 +277,50 @@ class BoardWidget(QWidget):
             self._anim.stop()
 
     # --- события мыши --------------------------------------------------
+    # Управление колодцей (стопкой) — кликом по её ВЕРХНЕЙ карте:
+    #   * клик по верхней карте колонки A — выбор;
+    #   * затем клик по верхней карте колонки B — перенос всей стопки A в B;
+    #   * повторный клик по той же верхней карте — снять выбор.
+    # Клик по «телу» стопки (не по верхней карте) не является ходом,
+    # поэтому он только подсвечивает колонку, но не выбирает её как источник.
+    def _cell_at(self, pos):
+        """(col, api_y) клетки под курсором или (None, None).
+
+        Экранная строка 0 (самая верхняя) == y_api 0 — инверсии нет.
+        """
+        for x in range(self.game.size[0]):
+            if not (self.col_rect(x).contains(pos)):
+                continue
+            row = int((pos.y() - PAD) // (CELL + GAP))
+            if 0 <= row <= self.game.size[1] - 1:
+                return x, row
+            return None, None
+        return None, None
+
     def mousePressEvent(self, ev):
-        if ev.button() == Qt.LeftButton:
-            x = self._col_at(ev.pos())
-            if x is None:
-                return
-            if not self.column_stack(x):
-                self.selected_col = None
-                self.update()
-                return
-            if self.selected_col is None:
-                self.selected_col = x
-            elif self.selected_col == x:
-                self.selected_col = None
-            else:
-                self.try_move(self.selected_col, x)
+        if ev.button() != Qt.LeftButton:
+            return
+        x, y = self._cell_at(ev.pos())
+        if x is None:
+            self.selected_col = None
             self.update()
+            return
+        top = self.top_index(x)
+        if top is None:                       # клик по пустой колонке
+            self.selected_col = None
+            self.update()
+            return
+        if y != top:                          # клик не по верхней карте
+            self.hover_col = x
+            self.update()
+            return
+        if self.selected_col is None:
+            self.selected_col = x
+        elif self.selected_col == x:
+            self.selected_col = None          # отмена выбора
+        else:
+            self.try_move(self.selected_col, x)
+        self.update()
 
     def mouseMoveEvent(self, ev):
         self.hover_col = self._col_at(ev.pos())
@@ -307,22 +382,25 @@ class BoardWidget(QWidget):
                 p.setBrush(QColor(255, 255, 255, 18))
                 p.drawRoundedRect(r, 14, 14)
 
-        # danger-линия: верхний (видимый) ряд заполнен — приближается переполнение
-        top_row = self.game.size[1] - 1
-        danger = any(self.game.field[x][top_row].value
+        # danger: карты дошли до нижнего ряда (y = size[1]-1) — поле заполнено
+        bottom_row = self.game.size[1] - 1
+        danger = any(self.game.field[x][bottom_row].value
                      for x in range(self.game.size[0]))
 
         # карты
         for x in range(self.game.size[0]):
             stack = self.column_stack(x)
             n = len(stack)
+            if not n:
+                continue
+            y_first = self.top_index(x)          # y самой верхней карты
             for i, v in enumerate(stack):
-                # i=0 — дно стопки; рисуем по координатам API: y=i, дно внизу
-                center = self.cell_center(x, i)
+                y = y_first + i                  # координата API == экранная строка
+                center = self.cell_center(x, y)
                 slide_off = 0.0
-                if self.row_slide > 0 and i == n - 1:
-                    # новая строка «входит» сверху вниз (к вершине стопки)
-                    slide_off = self.row_slide * (CELL + GAP) * 0.35
+                if self.row_slide > 0 and y == 0:
+                    # новая строка «въезжает» сверху: рисуем её со смещением вверх
+                    slide_off = -self.row_slide * (CELL + GAP)
                 rect = QRectF(center.x() - CELL / 2,
                               center.y() - CELL / 2 + slide_off,
                               CELL, CELL)
@@ -330,15 +408,15 @@ class BoardWidget(QWidget):
                 if x == self.selected_col:
                     scale = 1.0 + 0.03 * (i + 1) / max(n, 1)
                 self._draw_card(p, rect, v, scale=scale,
-                                flash=self.merge_flash.get((x, i), 0))
+                                flash=self.merge_flash.get((x, y), 0))
 
         if danger:
             pen = QPen(QColor(239, 93, 93, 220))
             pen.setWidth(3)
             p.setPen(pen)
             p.setBrush(Qt.NoBrush)
-            # линия над верхним (видимым) рядом — зона переполнения
-            line_y = PAD - 4
+            # линия ПОД нижним рядом — зона переполнения
+            line_y = PAD + self.game.size[1] * (CELL + GAP) - GAP + 4
             p.drawLine(int(PAD), int(line_y),
                        int(self.board_px_w() - PAD), int(line_y))
 
