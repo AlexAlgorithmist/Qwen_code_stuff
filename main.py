@@ -134,206 +134,348 @@ def ease_inout(t: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Планировщик анимаций: превращает пару снимков «до/после» в набор фаз
+# Планировщик анимаций: превращает снимки «до/после» в таймлайн фаз
 # ---------------------------------------------------------------------------
 
 class MovePlanner:
-    """Сравнивает снимки поля (dict {(x, y): value}) до и после хода движка
-    и строит план анимации.
+    """Строит план анимации хода, воспроизводя механику движка шаг за шагом.
 
-    Возвращаемый формат: список фаз [(ms, events), ...], где event — dict:
-      fly:    {'kind':'fly','frm':(x,y),'to':(x,y),'v':val,'delay':ms}
-      vanish: {'kind':'vanish','at':(x,y),'v':val,'delay':ms}
-      pop:    {'kind':'pop','at':(x,y),'v':val,'delay':ms}
-      spawn:  {'kind':'spawn','at':(x,y),'v':val,'delay':ms}   (новая карта)
-      slide:  {'kind':'slide','frm':(x,y),'to':(x,y),'v':val,'delay':ms}
-              (старая карта осела вниз под новые строки)
+    Движок (mergeCards/API.Game) мутирует поле мгновенно, поэтому GUI
+    проигрывает переход «до/после» как осмысленную последовательность:
+      fly    — полёт перенесённой пачки из источника в колонку-цель;
+      vanish — схлопывание карт, слившихся в пару (или канувших под край);
+      pop    — рождение результата слияния (pop + вспышка);
+      slide  — оседание колонок вверх к y=0 после слияний и съезд старых
+               карт вниз при появлении новых строк;
+      spawn  — въезд СВЕРХУ всех добавленных движком строк (каскадом).
+
+    Для переносов plan() сначала пытается точно симулировать ход движка
+    (simulate_move): перенос -> merge/compress цели -> доброс k строк,
+    подбирая вырез среза и k так, чтобы результат совпал со снимком after.
+    Если точная симуляция не сходится, используется эвристическое
+    сопоставление снимков (_diff_steps) — оно же применяется для add_row.
     """
 
     @staticmethod
-    def _landing_probe(before: dict, slice_cells, dst_x: int):
-        """Клетки, куда лёг бы переносимый срез БЕЗ слияний и доброса строк
-        (чистая механика action_full: пачка кладётся подряд под нижнюю
-        занятую клетку колонки-цели). Копия движка полностью независима:
-        _merge/_compress/_can_merge заглушены."""
-        try:
-            g = Game((BOARD_COLS, BOARD_ROWS), {}, _bag=[1])
-            g._merge = lambda *a, **kw: False
-            g._compress = lambda *a, **kw: False
-            g._can_merge = lambda *a, **kw: True
-            for (x, y), v in before.items():
-                if v and 0 <= x < BOARD_COLS and 0 <= y < BOARD_ROWS:
-                    g.field[x][y].value = v
-            sy = min(c[1] for c in slice_cells)
-            res, _added = g.action_full((slice_cells[0][0], sy), dst_x,
-                                        count=len(slice_cells))
-            if isinstance(res, tuple) or str(res) != "Success":
-                return []
-            taken = {(dst_x, y) for y in range(BOARD_ROWS)
-                     if g.field[dst_x][y].value}
-            return sorted(taken - set(slice_cells), key=lambda c: c[1])
-        except Exception:
-            return []
+    def _cols(snap):
+        """{(x,y):v} -> {x: {y:v}} только занятые клетки."""
+        out = {x: {} for x in range(BOARD_COLS)}
+        for (x, y), v in snap.items():
+            if v:
+                out[x][y] = v
+        return out
 
     @staticmethod
-    def plan(before: dict, after: dict, src_x=None, dst_x=None):
-        # --- 1. сопоставление карт «до» -> клетки «после» (жадно, по приоритету) ---
-        flights = []          # (frm, to, v) — перенесённый срез летит в dst
-        slides = []           # (frm, to, v) — старая карта осела вниз/уехала
-        stayers = set()       # (x, y) — карта осталась на месте
-        matched_after = set()
-        moved_src = set()
+    def _clean(col):
+        return {y: v for y, v in col.items() if v}
 
-        def take_value(col, val, used_rows):
-            """Первая незанятая клетка колонки col со значением val из after."""
-            for y in sorted(used_rows[val]):
-                if (col, y) in after and after[(col, y)] == val \
-                        and (col, y) not in matched_after:
-                    return (col, y)
+    # =====================================================================
+    # Основной вход
+    # =====================================================================
+    @staticmethod
+    def plan(before: dict, after: dict, src_x=None, dst_x=None):
+        steps = None
+        if src_x is not None and dst_x is not None:
+            try:
+                steps = MovePlanner.simulate_move(before, src_x, dst_x, after)
+            except Exception:
+                steps = None
+        if steps is None:
+            steps = MovePlanner._diff_steps(before, after)
+        return MovePlanner.timeline(steps)
+
+    # =====================================================================
+    # Точная симуляция хода по правилам движка (без случайного мешка):
+    #   1. срез src[cut:] кладётся ПОД нижнюю карту dst подряд;
+    #   2. merge+compress колонки dst (пара -> верхняя карта +1, нижняя
+    #      исчезает, затем колонка оседает к 0);
+    #   3. если слияний не было — движок добавил k>=1 строк сверху ВСЕХ
+    #      колонок (содержимое берём из after), затем снова merge всего
+    #      поля (цепочки от новой строки тоже описываются).
+    # Возвращает протокол шагов или None, если раскладка не сходится.
+    # =====================================================================
+    @staticmethod
+    def simulate_move(before: dict, src_x: int, dst_x: int, after: dict):
+        cb, ca = MovePlanner._cols(before), MovePlanner._cols(after)
+        src_cells = sorted(cb[src_x])
+        if not src_cells:
             return None
 
-        by_val = {}
-        for p, v in after.items():
-            if v:
-                by_val.setdefault(v, set()).add(p[1])
+        others_same = all(MovePlanner._clean(cb[x]) == MovePlanner._clean(ca[x])
+                          for x in range(BOARD_COLS)
+                          if x not in (src_x, dst_x))
 
-        if src_x is not None and dst_x is not None:
-            src_cells = sorted([p for p, v in before.items()
-                                if v and p[0] == src_x], key=lambda p: p[1])
-            # пачка ложится под нижнюю карту цели подряд; перебираем все
-            # варианты «сколько верхних карт среза выжило» и берём тот, где
-            # честные перелёты совпадают со значениями after (съеденные
-            # слиянием карты просто не имеют пары — они улетают «в схлопывание»)
-            best_cfg = None
-            for skip in range(len(src_cells), -1, -1):
-                survivors = src_cells[skip:]
-                if not survivors:
-                    cfg = []
-                    ok = True
-                    # цель пустая? тогда skip==len допустим только если в
-                    # after нет клеток dst, которые могли бы быть нашими
-                    cfg = []
-                    best_cfg = cfg
-                    continue
-                land_y = max([p[1] for p, v in after.items()
-                              if v and p[0] == dst_x] + [-1]) + 1 - len(survivors)
-                cfg = []
-                ok = True
-                for i, sp in enumerate(survivors):
-                    tp = (dst_x, land_y + i)
-                    if after.get(tp) != before[sp]:
+        for cut in range(len(src_cells)):
+            pack = [cb[src_x][y] for y in src_cells[cut:]]
+            steps = []
+            # --- 1. перенос ---
+            frm_cells = [(src_x, y) for y in src_cells[cut:]]
+            dst_rows = sorted(cb[dst_x])
+            base_y = (max(dst_rows) + 1) if dst_rows else 0
+            col_dst = dict(cb[dst_x])
+            for i, v in enumerate(pack):
+                yy = base_y + i
+                col_dst[yy] = v
+                steps.append({'op': 'fly', 'frm': frm_cells[i],
+                              'to': (dst_x, yy), 'v': v})
+            src_col = {y: v for y, v in cb[src_x].items() if y < src_cells[cut]}
+
+            # --- 2. merge+compress колонки цели ---
+            merged_any, col_dst, msteps = MovePlanner._merge_col(dst_x, dict(col_dst))
+            steps += msteps
+
+            if not others_same:
+                continue
+
+            if not merged_any:
+                res = MovePlanner._try_growth(src_x, dst_x, src_col, col_dst,
+                                              cb, ca, steps)
+                if res is not None:
+                    return res
+                continue
+
+            if MovePlanner._clean(col_dst) == MovePlanner._clean(ca[dst_x]) and \
+               MovePlanner._clean(src_col) == MovePlanner._clean(ca[src_x]):
+                return steps
+            res = MovePlanner._try_growth(src_x, dst_x, src_col, col_dst,
+                                          cb, ca, steps)
+            if res is not None:
+                return res
+        return None
+
+    @staticmethod
+    def _merge_col(x, col):
+        """Алгоритм Game.merge/_merge/_compress для одной колонки: пары
+        схлопываются (результат — ВЕРХНЯЯ клетка пары), затем колонка
+        оседает к 0. Возвращает (was_merged, new_col, steps)."""
+        steps = []
+        merged_any = False
+        changed = True
+        while changed:
+            changed = False
+            ys = sorted(MovePlanner._clean(col))
+            for a, b in zip(ys, ys[1:]):
+                if col[a] == col[b]:
+                    nv = col[a] + 1
+                    steps.append({'op': 'vanish', 'at': (x, b), 'v': col[b]})
+                    steps.append({'op': 'merge', 'at': (x, a), 'v': nv})
+                    col[a] = nv
+                    col[b] = 0
+                    merged_any = changed = True
+                    break
+        ys_all = sorted(MovePlanner._clean(col))
+        newcol = {}
+        for new_y, old_y in enumerate(ys_all):
+            v = col[old_y]
+            if new_y != old_y:
+                steps.append({'op': 'slide', 'frm': (x, old_y),
+                              'to': (x, new_y), 'v': v})
+            newcol[new_y] = v
+        return merged_any, newcol, steps
+
+    @staticmethod
+    def _try_growth(src_x, dst_x, src_col, col_dst, cb, ca, steps_in):
+        """Подбирает число добавленных строк k: состояние до доброса со
+        сдвигом на k должно совпасть с after, а оставшиеся клетки after
+        (rows < k) — это новые строки. Описывает cascade-down, spawn и
+        пост-добросовые слияния. Возвращает шаги или None."""
+        cur = {}
+        for x in range(BOARD_COLS):
+            if x == src_x:
+                cur[x] = MovePlanner._clean(src_col)
+            elif x == dst_x:
+                cur[x] = MovePlanner._clean(col_dst)
+            else:
+                cur[x] = MovePlanner._clean(cb[x])
+
+        for k in range(1, BOARD_ROWS + 8):
+            ok = True
+            used_after = set()
+            for x in range(BOARD_COLS):
+                for y, v in cur[x].items():
+                    ny = y + k
+                    if ca[x].get(ny) != v:
                         ok = False
                         break
-                    cfg.append((sp, tp))
-                if ok and (best_cfg is None or len(cfg) > len(best_cfg)):
-                    best_cfg = cfg
-            # добавляем также вариант без «выживших», но с частичным match
-            if best_cfg is None:
-                best_cfg = []
-            # поверх best_cfg попробуем удлинить за счёт любых честных
-            # соответствий src->dst (на случай нестандартных раскладок)
-            claimed = {c[0] for c in best_cfg}
-            for sp in src_cells:
-                if sp in claimed:
-                    continue
-                tv = before[sp]
-                tp = take_value(dst_x, tv, by_val)
-                if tp:
-                    best_cfg.append((sp, tp))
-                    claimed.add(sp)
-            for sp, tp in best_cfg:
-                matched_after.add(tp)
-                moved_src.add(sp)
-                flights.append((sp, tp, before[sp]))
-
-        # остальные карты: остаться / съехать (только вниз или горизонтально
-        # к своей новой позиции после компрессии)
-        rest = sorted([p for p, v in before.items()
-                       if v and p not in moved_src], key=lambda p: (-p[1], p[0]))
-        for fp in rest:
-            fv = before[fp]
-            if after.get(fp) == fv and fp not in matched_after:
-                matched_after.add(fp)
-                stayers.add(fp)
+                    used_after.add((x, ny))
+                if not ok:
+                    break
+            if not ok:
                 continue
+            leftover = {}
+            bad = False
+            for x in range(BOARD_COLS):
+                for y, v in ca[x].items():
+                    if (x, y) not in used_after:
+                        if y >= k:
+                            bad = True
+                            break
+                        leftover.setdefault(x, {})[y] = v
+                if bad:
+                    break
+            if bad:
+                continue
+
+            steps = list(steps_in)
+            grown = {x: {y + k: v for y, v in cur[x].items()}
+                     for x in range(BOARD_COLS)}
+            for x in range(BOARD_COLS):
+                for y, v in sorted(leftover.get(x, {}).items()):
+                    grown[x][y] = v
+
+            # моделируем post-merge движка поверх grown: он обязан дать ca
+            extra = []
+            final_ok = True
+            for x in range(BOARD_COLS):
+                _mm, ncol, msteps = MovePlanner._merge_col(x, dict(grown[x]))
+                if MovePlanner._clean(ncol) != MovePlanner._clean(ca[x]):
+                    final_ok = False
+                    break
+                extra += msteps
+            if not final_ok:
+                continue
+
+            # cascade: старые карты съезжают вниз на k (снизу вверх)
+            for x in range(BOARD_COLS):
+                for y, v in sorted(cur[x].items(), reverse=True):
+                    steps.append({'op': 'slide', 'frm': (x, y),
+                                  'to': (x, y + k), 'v': v})
+            # spawn новых клеток rows<k; результаты post-merge делает pop,
+            # а их нижние половины — vanish (уже описаны в extra)
+            popped = {tuple(s['at']) for s in extra if s['op'] == 'merge'}
+            for x in range(BOARD_COLS):
+                for y, v in sorted(leftover.get(x, {}).items()):
+                    if (x, y) in popped:
+                        continue
+                    steps.append({'op': 'spawn', 'at': (x, y), 'v': v})
+            steps += extra
+            return steps
+        return None
+
+    # =====================================================================
+    # Эвристический разбор чистой разницы двух снимков (add_row и пр.)
+    # =====================================================================
+    @staticmethod
+    def _diff_steps(before: dict, after: dict):
+        cb, ca = MovePlanner._cols(before), MovePlanner._cols(after)
+        steps = []
+        stay = set()
+        matched_after = set()
+        for x in range(BOARD_COLS):
+            for y, v in sorted(cb[x].items()):
+                if ca[x].get(y) == v and (x, y) not in matched_after:
+                    matched_after.add((x, y))
+                    stay.add((x, y))
+
+        moved_cards = [(x, y) for x in range(BOARD_COLS)
+                       for y in cb[x] if (x, y) not in stay]
+        by_val = {}
+        for x in range(BOARD_COLS):
+            for y, v in ca[x].items():
+                by_val.setdefault(v, []).append((x, y))
+        used_after = set(matched_after)
+        slides, lost = [], []
+        for fp in sorted(moved_cards, key=lambda p: (-p[1], p[0])):
+            fv = cb[fp[0]][fp[1]]
             cand = None
-            for tp, tv in after.items():
-                if tv != fv or tp in matched_after:
+            for tp in by_val.get(fv, []):
+                if tp in used_after:
                     continue
-                d = abs(tp[1] - fp[1]) + (abs(tp[0] - fp[0]) * 4 if tp[0] != fp[0] else 0)
+                d = abs(tp[1] - fp[1]) + (abs(tp[0] - fp[0]) * 4
+                                          if tp[0] != fp[0] else 0)
                 if cand is None or d < cand[0]:
                     cand = (d, tp)
-            if cand:
-                matched_after.add(cand[1])
+            if cand and cand[0] <= 10:
+                used_after.add(cand[1])
                 slides.append((fp, cand[1], fv))
+            else:
+                lost.append(fp)
+        for f, t_, v in slides:
+            steps.append({'op': 'slide', 'frm': f, 'to': t_, 'v': v})
 
-        vanished = [p for p, v in before.items()
-                    if v and p not in stayers and p not in moved_src
-                    and p not in {s[0] for s in slides}]
-        appeared = {p: v for p, v in after.items() if v and p not in matched_after}
-
-        # --- 2. слияния: новая клетка + рядом исчезнувшая карта уровнем ниже ---
-        merges = []           # ([parts], result_cell, value)
-        used_parts = set()
+        appeared = {}
+        for x in range(BOARD_COLS):
+            for y, v in ca[x].items():
+                if (x, y) not in used_after:
+                    appeared[(x, y)] = v
+        lost_set = set(lost)
+        merged_results = set()
         for ap in sorted(appeared, key=lambda p: (p[1], p[0])):
             av = appeared[ap]
-            if av <= 1:
-                continue
             parts = []
             for nb in ((ap[0], ap[1] - 1), (ap[0], ap[1] + 1)):
-                if nb in vanished and nb not in used_parts and before[nb] == av - 1:
+                if nb in lost_set and cb[nb[0]].get(nb[1]) == av - 1:
                     parts.append(nb)
-            if parts:
+            if len(parts) == 2 or (parts and before.get(ap, 0) == 0):
                 for q in parts:
-                    used_parts.add(q)
-                merges.append((parts, ap, av))
-        merged_results = {r for _p, r, _v in merges}
-        merge_parts = used_parts
-        vanish_rest = [p for p in vanished if p not in merge_parts]
-        new_cells = {p: v for p, v in appeared.items() if p not in merged_results}
+                    lost_set.discard(q)
+                    steps.append({'op': 'vanish', 'at': q, 'v': cb[q[0]][q[1]]})
+                steps.append({'op': 'merge', 'at': ap, 'v': av})
+                merged_results.add(ap)
+        for p in sorted(lost_set, key=lambda c: (c[1], c[0])):
+            steps.append({'op': 'vanish', 'at': p, 'v': cb[p[0]][p[1]]})
+        for ap, av in sorted(appeared.items(), key=lambda it: (it[0][1], it[0][0])):
+            if ap in merged_results:
+                continue
+            steps.append({'op': 'spawn', 'at': ap, 'v': av})
+        return steps
 
-        # --- 3. тайминги: фазы идут последовательно, внутри фазы стаг ---
+    # =====================================================================
+    # Протокол шагов -> таймлайн фаз [(dur_ms, [event...]), ...]
+    # =====================================================================
+    @staticmethod
+    def timeline(steps):
+        FLY, VAN, POP, SLD, SPW = (BoardWidget.FLY_MS, BoardWidget.VANISH_MS,
+                                   BoardWidget.POP_MS, BoardWidget.SLIDE_MS,
+                                   BoardWidget.SPAWN_MS)
         phases = []
-        if flights:
-            flights.sort(key=lambda it: it[1][1])     # верх летит первым
+        groups = []
+        for st in steps:
+            if groups and groups[-1][0] == st['op']:
+                groups[-1][1].append(st)
+            else:
+                groups.append((st['op'], [st]))
+        for op, items in groups:
             ev = []
-            t = 0.0
-            for i, (frm, to, v) in enumerate(flights):
-                ev.append({'kind': 'fly', 'frm': frm, 'to': to, 'v': v,
-                           'delay': round(t)})
-                t += 70.0
-            phases.append((BoardWidget.FLY_MS, ev))
-
-        if vanish_rest or merge_parts:
-            ev = [{'kind': 'vanish', 'at': p, 'v': before[p],
-                   'delay': round(i * 25.0)}
-                  for i, p in enumerate(sorted(set(vanish_rest) | merge_parts,
-                                               key=lambda c: c[1]))]
-            phases.append((BoardWidget.VANISH_MS, ev))
-
-        if merges:
-            ev = [{'kind': 'pop', 'at': r, 'v': v, 'delay': round(i * 90.0)}
-                  for i, (_p, r, v) in enumerate(merges)]
-            phases.append((BoardWidget.POP_MS, ev))
-
-        if slides:
-            slides.sort(key=lambda it: -it[0][1])     # снизу вверх
-            ev = [{'kind': 'slide', 'frm': f, 'to': t_, 'v': v,
-                   'delay': round(i * 20.0)}
-                  for i, (f, t_, v) in enumerate(slides)]
-            phases.append((BoardWidget.SLIDE_MS, ev))
-
-        if new_cells:
-            # каскад: чем выше строка въезжает, тем раньше стартует;
-            # ВСЕ добавленные движком строки анимируются, а не одна
-            rows = sorted({p[1] for p in new_cells})
-            rank = {r: i for i, r in enumerate(rows)}
-            ev = [{'kind': 'spawn', 'at': p, 'v': v,
-                   'delay': round(rank[p[1]] * 110.0 + p[0] * 12.0)}
-                  for p, v in sorted(new_cells.items(), key=lambda it: (it[0][1], it[0][0]))]
-            phases.append((BoardWidget.SPAWN_MS + rank[rows[-1]] * 110.0, ev))
-
-        # гарантируем непустой план (ход без видимых изменений)
+            if op == 'fly':
+                items.sort(key=lambda s: s['to'][1])
+                t = 0.0
+                for s in items:
+                    ev.append({'kind': 'fly', 'frm': s['frm'], 'to': s['to'],
+                               'v': s['v'], 'delay': round(t)})
+                    t += 70.0
+                phases.append((FLY + min(t, 350.0), ev))
+            elif op == 'vanish':
+                t = 0.0
+                for s in sorted(items, key=lambda q: (q['at'][1], q['at'][0])):
+                    ev.append({'kind': 'vanish', 'at': s['at'], 'v': s['v'],
+                               'delay': round(t)})
+                    t += 60.0
+                phases.append((VAN + min(t, 240.0), ev))
+            elif op == 'merge':
+                t = 0.0
+                for s in sorted(items, key=lambda q: (q['at'][1], q['at'][0])):
+                    ev.append({'kind': 'pop', 'at': s['at'], 'v': s['v'],
+                               'delay': round(t)})
+                    t += 90.0
+                phases.append((POP + min(t, 360.0), ev))
+            elif op == 'slide':
+                items.sort(key=lambda s: -s['frm'][1])
+                t = 0.0
+                for s in items:
+                    ev.append({'kind': 'slide', 'frm': s['frm'], 'to': s['to'],
+                               'v': s['v'], 'delay': round(t)})
+                    t += 25.0
+                phases.append((SLD + min(t, 250.0), ev))
+            elif op == 'spawn':
+                rows = sorted({s['at'][1] for s in items})
+                rank = {r: i for i, r in enumerate(rows)}
+                for s in sorted(items, key=lambda q: (q['at'][1], q['at'][0])):
+                    ev.append({'kind': 'spawn', 'at': s['at'], 'v': s['v'],
+                               'delay': round(rank[s['at'][1]] * 110.0
+                                              + s['at'][0] * 12.0)})
+                last_rank = max(rank.values()) if rank else 0
+                phases.append((SPW + last_rank * 110.0, ev))
         if not phases:
             phases = [(1, [])]
         return phases
@@ -707,7 +849,10 @@ class BoardWidget(QWidget):
     # --- планирование и плеер анимаций --------------------------------
     def _play(self, before, after, src_x, dst_x, gameover_msg=None):
         """Строит таймлайн по снимкам и запускает плеер."""
-        phases = MovePlanner.plan(before, after, src_x, dst_x)
+        try:
+            phases = MovePlanner.plan(before, after, src_x, dst_x)
+        except Exception:
+            phases = [(1, [])]        # план построился с ошибкой — без анимации
         timeline = []
         t = 0
         for dur, evs in phases:
@@ -1047,6 +1192,14 @@ class BoardWidget(QWidget):
     def paintEvent(self, ev):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        try:
+            self._paint_frame(p)
+        except Exception:
+            pass                     # кадр не должен ронять приложение
+        finally:
+            p.end()
+
+    def _paint_frame(self, p):
 
         w, h = self.width(), self.height()
         grad = QLinearGradient(0, 0, 0, h)
@@ -1154,12 +1307,10 @@ class BoardWidget(QWidget):
                 p.drawRoundedRect(r, 14, 14)
                 p.setPen(Qt.NoPen)
 
-        p.end()
-
     def _paint_animated(self, p: QPainter, sel_x, sel_y):
         """Кадр анимированного перехода между снимками _base и _after."""
-        moving_src = {f for f, _t, _v in self._flights}
-        sliding_frm = {f for f, _t, _v in self._sliding}
+        moving_src = {f for f, _t, _v, _u in self._flights}
+        sliding_frm = {f for f, _t, _v, _u in self._sliding}
         vanish_at = {a for a, _v, _u in self._vanishing}
         pop_at = {a for a, _v, _u in self._popping}
         spawn_at = {a for a, _v, _u in self._spawning}
