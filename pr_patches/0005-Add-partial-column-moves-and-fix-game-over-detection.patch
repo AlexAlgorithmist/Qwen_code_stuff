@@ -1,0 +1,1727 @@
+From 469a4c6a330ee425403d63b0c58c1740ecef6406 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Mon, 5 Oct 2026 13:11:30 +0000
+Subject: [PATCH 5/8] Add partial column moves and fix game-over detection
+
+- Implement Ctrl+Wheel, Up/Down keys to select specific cards within a stack for partial transfers instead of moving entire columns
+- Add Shift+Click modifier to force full-column selection when needed
+- Refactor legal move validation to use deep-cloned game states via `clone_game` to prevent state corruption from engine's shared `_bag` reference bug
+- Update deadlock logic: treat moves resulting in "Game Over" as invalid actions, ensuring the game only ends when no valid non-terminal moves or row additions remain
+- Introduce undo functionality (Z key/button) with serialization/deserialization of game state for safe move reversal
+- Enhance UI feedback with visual indicators for selected card ranges, drag-and-drop ghosts, and merge flash animations
+---
+ .gitignore                                 |   4 +-
+ __pycache__/main.cpython-312.pyc           | Bin 39874 -> 56621 bytes
+ main.py                                    | 674 +++++++++++++++------
+ mergeCards/__pycache__/API.cpython-312.pyc | Bin 17271 -> 17282 bytes
+ 4 files changed, 484 insertions(+), 194 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index ba0430d..cd595dc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,3 @@
+-__pycache__/
+\ No newline at end of file
++# Python cache
++__pycache__/
++*.pyc
+\ No newline at end of file
+diff --git a/__pycache__/main.cpython-312.pyc b/__pycache__/main.cpython-312.pyc
+index 7656f279645f272a195c9bb06393985592d45abf..482bdb2164392a94c1962626880083c262d8d51b 100644
+GIT binary patch
+literal 56621
+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
+SU-K8em-Rq%iT82|kN*pUpZxy-
+
+delta 17563
+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
+zN&z*<LcsvC05Jt_K?Nq%0D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
+
+diff --git a/main.py b/main.py
+index 56961eb..60bd86e 100644
+--- a/main.py
++++ b/main.py
+@@ -2,16 +2,27 @@
+ """
+ Визуальный клиент (GUI) для игры "mergeCards" на PyQt5.
+ 
+-Игровая логика берётся из mergeCards/API.py (класс Game).
+-Управление:
+-    - Клик по колонке            — выбрать колонку-источник (берётся верхняя карта стопки);
+-      повторный клик по той же   — снять выбор;
+-    - Клик по другой колонке     — переместить всю стопку выбранной колонки в целевую;
+-    - Стрелки Left / Right       — то же самое с клавиатуры (выбор -> цель);
+-    - Пробел                     — добавить строку сверху (add_row);
+-    - R                          — новая игра;  Esc — выход.
+-
+-Запуск:  python main.py
++Игровая логика — mergeCards/API.py (класс Game). GUI ничего не «чинит»
++в движке, но корректно его использует:
++
++Управление мышью:
++    - клик по ЛЮБОЙ карте       — выбрать её как источник; переносится
++      выбранная карта и ВСЁ, что под ней (это ограничение движка);
++    - drag (зажать и тащить)   — взять верхнюю карту стопки (или всю
++      стопку целиком, если схватили за её тело) и бросить в колонку;
++    - Ctrl+колесо / Up / Down   — выбрать карту НИЖЕ/ВЫШЕ в стопке,
++      т.е. переносить не всю колонку, а только часть («определённые карты»);
++    - Shift+клик                — сразу перенести ВЕСЬ столбец в цель;
++    - стрелки Left / Right      — выбор цели для переноса с клавиатуры;
++    - Пробел                    — добавить строку сверху (add_row);
++    - Z                         — отменить последний ход;
++    - R                         — новая игра;  Esc — выход.
++
++Смерть (Game Over) наступает ТОЛЬКО когда не осталось ни одного хода
++ни у переносов, ни у кнопки «+ Строка». Ходы, которые сами по себе
++заполняют поле, разрешены — после них можно спастись новой строкой
++(движок это позволяет), поэтому «застрять без возможности проиграть»
++невозможно.
+ """
+ 
+ import os
+@@ -21,7 +32,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mer
+ 
+ from PyQt5.QtCore import Qt, QRectF, QPointF, QTimer  # noqa: E402
+ from PyQt5.QtGui import (  # noqa: E402
+-    QColor, QFont, QPainter, QLinearGradient, QPainterPath, QPen,
++    QColor, QFont, QCursor, QPainter, QLinearGradient, QPainterPath, QPen,
+ )
+ from PyQt5.QtWidgets import (  # noqa: E402
+     QApplication, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton,
+@@ -29,7 +40,7 @@ from PyQt5.QtWidgets import (  # noqa: E402
+ )
+ 
+ try:  # используем API из mergeCards/
+-    from API import Game, pretty_number
++    from API import Game, Card, pretty_number  # noqa: E402
+ except Exception as exc:  # pragma: no cover
+     print("Не удалось импортировать mergeCards/API.py:", exc)
+     raise
+@@ -94,14 +105,15 @@ def card_label(value: int) -> str:
+ # ---------------------------------------------------------------------------
+ 
+ class BoardWidget(QWidget):
+-    """Рисует поле Game и обрабатывает клики/перетаскивание колонок."""
++    """Рисует поле Game и обрабатывает клики/drag-and-drop колонок."""
+ 
+     def __init__(self, game: Game, parent=None):
+         super().__init__(parent)
+         self.game = game
+-        self.selected_col = None          # выбранная колонка-источник
++        self.selected = None              # (x, y) — выбранная карта-источник
+         self.hover_col = None             # колонка под курсором
+-        self.drag_from = None             # колонка, от которой начали перетаскивание
++        self.drag_from = None             # (x, y) — откуда начали перетаскивание
++        self.drag_all_column = False      # тянем весь столбец?
+         self.drag_pos = None              # позиция курсора во время перетаскивания
+         self.merge_flash = {}             # (x, y) -> оставшееся время вспышки, мс
+         self.row_slide = 0.0              # прогресс анимации сдвига строки (0..1)
+@@ -136,124 +148,214 @@ class BoardWidget(QWidget):
+         cy = PAD + y * (CELL + GAP) + CELL / 2
+         return QPointF(cx, cy)
+ 
++    def cell_rect(self, x, y):
++        c = self.cell_center(x, y)
++        return QRectF(c.x() - CELL / 2, c.y() - CELL / 2, CELL, CELL)
++
+     def _col_at(self, pos: QPointF):
+         for x in range(self.game.size[0]):
+-            r = self.col_rect(x)
+-            if r.contains(pos):
++            if self.col_rect(x).contains(pos):
+                 return x
+         return None
+ 
+-    # --- игровые действия --------------------------------------------
+-    def column_stack(self, x):
+-        """Уровни карт колонки x сверху вниз; индекс списка == координата y API.
+-
+-        В API y = 0 — верхний видимый ряд: новые строки появляются именно
+-        сверху (_addrow сдвигает всё вниз), а «дно» колодца — это y = size[1]-1.
+-        Карты в колонке лежат подряд от какого-то y до дна.
+-        """
+-        vals = []
+-        for y in range(self.game.size_calc[1]):
+-            v = self.game.field[x][y].value
+-            if v:
+-                vals.append(v)
+-        return vals
+-
++    # --- состояние поля ----------------------------------------------
+     def top_index(self, x):
+-        """Координата y САМОЙ ВЕРХНЕЙ карты колонки (или None если пуста).
+-
+-        action_full((x, y), dst) забирает из колонки x ВСЕ карты начиная с
+-        ряда y и ниже (y .. size[1]-1). Чтобы перенести всю стопку целиком,
+-        нужно передать y самой верхней занятой клетки.
+-        """
++        """y самой ВЕРХНЕЙ занятой клетки колонки (None, если колонка пуста)."""
+         for y in range(self.game.size_calc[1]):
+             if self.game.field[x][y].value:
+                 return y
+         return None
+ 
++    def bottom_index(self, x):
++        """y самой НИЖНЕЙ занятой клетки колонки (None, если колонка пуста)."""
++        b = None
++        for y in range(self.game.size_calc[1]):
++            if self.game.field[x][y].value:
++                b = y
++        return b
++
++    def column_height(self, x):
++        t = self.top_index(x)
++        return 0 if t is None else self.bottom_index(x) - t + 1
++
++    def value_at(self, x, y):
++        if 0 <= x < self.game.size[0] and 0 <= y < self.game.size_calc[1]:
++            return self.game.field[x][y].value
++        return 0
++
++    def visible_cards(self, x):
++        """y-координаты только ВИДИМЫХ карт колонки (движок хранит карты и
++        за нижним краем поля — их показывать и выбирать нельзя)."""
++        return [y for y in range(self.game.size[1]) if self.value_at(x, y)]
++
++    def selected_count(self):
++        """Сколько карт будет перенесено при текущем выборе.
++
++        Движок переносит выбранную карту и ВСЁ под ней до конца стопки
++        (action_full собирает карты от posFrom.y до низа), поэтому, чтобы
++        перенести НЕ весь столбец, надо выбрать карту не самую верхнюю.
++        """
++        if self.selected is None:
++            return 0
++        x, y = self.selected
++        cnt = 0
++        yy = y
++        while self.value_at(x, yy):
++            cnt += 1
++            yy += 1
++        return cnt
++
++    # --- проверка ходов через движок (на копиях!) ----------------------
++    def _clone(self) -> Game:
++        """Полноценный независимый клон игры.
++
++        ВАЖНО: у mergeCards/API.Game.copy() есть особенность — _bag
++        передаётся ПО ССЫЛКЕ, и его мутация в копии портит оригинал
++        (и наоборот). Поэтому пересобираем игру из сериализованного
++        состояния с НЕЗАВИСИМЫМ списком _bag.
++        """
++        win = self.window()
++        if win is not None and hasattr(win, "clone_game"):
++            return win.clone_game(self.game)
++        return self._fallback_clone(self.game)
++
++    @staticmethod
++    def _fallback_clone(g: Game) -> Game:
++        cards = {}
++        for x in range(g.size[0]):
++            for y in range(g.size_calc[1]):
++                v = g.field[x][y].value
++                if v:
++                    cards.setdefault(x, {})[y] = Card((x, y), v)
++        gc = Game(g.size, cards, points=g.points, bestCombo=g.bestCombo,
++                  _bag=list(g._bag))
++        gc.lastCombo = list(g.lastCombo)
++        return gc
++
++    def _try_move(self, src_x, src_y, dst_x, count_rows):
++        """Прогоняет ход через КОПИЮ движка.
++
++        Возвращает None, если ход невозможен (Invalid position / падение),
++        или ('Success'|'Game Over...', gcopy, added_row) — результат на копии.
++        Оригинал никогда не мутируется.
++        """
++        try:
++            gc = self._clone()
++            res, added = gc.action_full((src_x, src_y), dst_x, count=count_rows)
++        except Exception:
++            return None
++        if isinstance(res, tuple):           # маловероятно, но подстрахуемся
++            res = str(res[0])
++        if res == "Invalid position":
++            return None
++        return res, gc, added
++
+     def legal_moves(self):
+-        """Список ходов (src, dst), которые движок точно примет без Game Over.
++        """Все варианты переноса, которые движок принимает.
+ 
+-        Проверка идёт на КОПИИ игры (action_full мутирует поле и может
+-        вернуть 'Game Over', не откатывая состояние), поэтому оригинал
+-        никогда не портится. Ход считается легальным, если копия отвечает
+-        'Success' и при этом поле после хода остаётся в «живом» состоянии
+-        (ни одна карта не вышла за нижний край поля).
++        Элемент: (src_x, src_y, dst_x, count, result)
++        result == 'Success' либо 'Game Over...' — второй вариант ходом НЕ
++        считается (см. has_any_action). Перебираются только видимые карты.
+         """
+-        moves = []
+-        if self.game_over_flag():
+-            return moves
+-        bottom = self.game.size[1] - 1
+-        for src in range(self.game.size[0]):
+-            top = self.top_index(src)
+-            if top is None:
++        out = []
++        for sx in range(self.game.size[0]):
++            vis = self.visible_cards(sx)
++            if not vis:
+                 continue
+-            for dst in range(self.game.size[0]):
+-                if dst == src:
+-                    continue
+-                try:
+-                    gcopy = self.game.copy()
+-                    res, _ = gcopy.action_full((src, top), dst)
+-                except Exception:
+-                    continue
+-                if res != "Success":
+-                    continue
+-                if any(gcopy.field[x][bottom].value for x in range(self.game.size[0])):
+-                    continue  # ход привёл бы к переполнению — не предлагаем
+-                moves.append((src, dst))
+-        return moves
+-
+-    def has_legal_move(self):
+-        return bool(self.legal_moves())
++            t = vis[0]
++            for sy in vis:
++                cnt = self.selected_count_at(sx, sy)
++                for dx in range(self.game.size[0]):
++                    if dx == sx:
++                        continue
++                    r = self._try_move(sx, sy, dx, cnt)
++                    if r is None:
++                        continue
++                    res, gc, added = r
++                    out.append((sx, sy, dx, cnt, res))
++        return out
++
++    def selected_count_at(self, x, y):
++        """Сколько карт уйдёт при выборе карты (x, y)."""
++        cnt, yy = 0, y
++        while self.value_at(x, yy):
++            cnt += 1
++            yy += 1
++        return cnt
++
++    def add_row_survives(self):
++        """Выживет ли игра после «+ Строка» (проверяется на копии)."""
++        try:
++            gc = self._clone()
++            res = gc.add_row()
++        except Exception:
++            return False
++        if isinstance(res, tuple):
++            return False
++        return not any(gc.field[x][self.game.size[1]].value
++                       for x in range(self.game.size[0]))
++
++    def has_any_action(self):
++        if self.game_over_flag():
++            return False
++        # Ходы, которые сами заканчивают игру («Game Over...»), действиями
++        # не считаются: иначе игра никогда не признает поражение.
++        if any(m[4] == "Success" for m in self.legal_moves()):
++            return True
++        return self.add_row_survives()
+ 
+     def game_over_flag(self):
+         win = self.window()
+         return bool(win is not None and getattr(win, "game_over", False))
+ 
+-    def try_move(self, src: int, dst: int):
+-        """Выполняет ход «перенести всю стопку колонки src в колонку dst».
+-
+-        Перед вызовом движка ход проверяется на копии (legal_moves), чтобы
+-        GUI никогда не уводил игру в нереверсивный Game Over из-за клика.
+-        """
+-        if src is None or dst is None or src == dst:
+-            self.selected_col = None
+-            self.update()
+-            return False
++    # --- выполнение хода ----------------------------------------------
++    def try_move(self, src_x, src_y, dst_x, count_rows=None):
++        """Совершает перенос; возвращает True, если ход был принят."""
+         win = self.window()
++        if win is None:
++            return False
+         if getattr(win, "game_over", False):
+             return False
+-        top = self.top_index(src)
+-        if top is None:
+-            self.selected_col = None
++        if src_x == dst_x:
++            self.selected = None
+             self.update()
+             return False
+-        if (src, dst) not in self.legal_moves():
+-            self.selected_col = None
+-            win.show_status("Такой ход приведёт к заполнению поля — выберите другую цель.",
+-                            warn=True)
++        if count_rows is None:
++            count_rows = self.selected_count() or 1
++        r = self._try_move(src_x, src_y, dst_x, count_rows)
++        if r is None:
++            self.selected = None
++            win.show_status("Такой перенос движок не принимает.", warn=True)
+             self.update()
+             return False
+-        before = {(x, y, v) for (x, y, v) in self._all_values()}
++        res, gc, added = r
++        before = {(x, y, v) for x, y, v in self._all_values()}
++        win.push_undo()
++        # применяем тот же ход к оригиналу (детерминированно, тем же путём)
+         try:
+-            res, added = self.game.action_full((src, top), dst)
+-        except Exception as exc:  # движок не должен падать, но подстрахуемся
+-            self.selected_col = None
++            real_res, real_added = self.game.action_full(
++                (src_x, src_y), dst_x, count=count_rows)
++        except Exception as exc:
++            win.pop_undo_discard()
++            self.selected = None
+             win.show_status(f"Ошибка хода: {exc}", warn=True)
+             return False
+-        self.selected_col = None
+-        if isinstance(res, str) and res.startswith("Game Over"):
+-            win.on_game_over(res)
+-        elif res != "Success":
+-            win.show_status("Нельзя так ходить! (стопка не помещается)", warn=True)
++        self.selected = None
++        if isinstance(real_res, tuple):
++            real_res = str(real_res[0])
++        if real_res.startswith("Game Over"):
++            # ход заполнил поле — но это ЧЕСТНЫЙ проигрыш: до него у игрока
++            # всегда была альтернатива («+ Строка» или другой ход).
++            win.on_game_over(real_res)
++        elif real_res != "Success":
++            win.undo_last(reason="Ход отвергнут движком.")
+         else:
+             self._detect_flashes(before)
+-            if added:
++            if added or real_added:
+                 self.row_slide = 1.0
+             combo = max(self.game.lastCombo) if self.game.lastCombo else 0
+-            msg = "Ход сделан"
+-            if combo > 1:
+-                msg = f"Комбо x{combo}!"
+-            win.show_status(msg)
++            win.show_status(f"Комбо x{combo}!" if combo > 1 else
++                            f"Перенесено карт: {count_rows}.")
+         win.refresh_stats()
+         win.check_deadlock()
+         self._start_anim()
+@@ -263,7 +365,7 @@ class BoardWidget(QWidget):
+     def _all_values(self):
+         out = []
+         for x in range(self.game.size[0]):
+-            for y in range(self.game.size[1]):
++            for y in range(self.game.size_calc[1]):
+                 v = self.game.field[x][y].value
+                 if v:
+                     out.append((x, y, v))
+@@ -296,24 +398,14 @@ class BoardWidget(QWidget):
+             self._anim.stop()
+ 
+     # --- события мыши --------------------------------------------------
+-    # Управление колодцей (стопкой) — кликом по её ВЕРХНЕЙ карте:
+-    #   * клик по верхней карте колонки A — выбор;
+-    #   * затем клик по верхней карте колонки B — перенос всей стопки A в B;
+-    #   * повторный клик по той же верхней карте — снять выбор.
+-    # Клик по «телу» стопки (не по верхней карте) не является ходом,
+-    # поэтому он только подсвечивает колонку, но не выбирает её как источник.
+     def _cell_at(self, pos):
+-        """(col, api_y) клетки под курсором или (None, None).
+-
+-        Экранная строка 0 (самая верхняя) == y_api 0 — инверсии нет.
+-        """
+-        for x in range(self.game.size[0]):
+-            if not (self.col_rect(x).contains(pos)):
+-                continue
+-            row = int((pos.y() - PAD) // (CELL + GAP))
+-            if 0 <= row <= self.game.size[1] - 1:
+-                return x, row
++        """(col, api_y) клетки под курсором или (None, None)."""
++        x = self._col_at(QPointF(pos.x(), PAD + 1))
++        if x is None:
+             return None, None
++        row = int((pos.y() - PAD) // (CELL + GAP))
++        if 0 <= row <= self.game.size[1] - 1:
++            return x, row
+         return None, None
+ 
+     def mousePressEvent(self, ev):
+@@ -321,52 +413,136 @@ class BoardWidget(QWidget):
+             return
+         x, y = self._cell_at(ev.pos())
+         if x is None:
+-            self.selected_col = None
++            self.selected = None
+             self.update()
+             return
+-        top = self.top_index(x)
+-        if top is not None and abs(y - top) <= 1:
+-            # клик по верхней карте (или впритык под ней — зона «схвата» стопки)
+-            if self.selected_col is None:
+-                self.selected_col = x
+-            elif self.selected_col == x:
+-                self.selected_col = None          # отмена выбора
++        t = self.top_index(x)
++        prev = self.selected          # выбор ДО этого нажатия
++        if t is None:
++            # клик по пустой колонке: если есть выбранный источник — переносим
++            if prev is not None:
++                self.try_move(prev[0], prev[1], x, self.selected_count())
+             else:
+-                self.try_move(self.selected_col, x)
+-        elif self.selected_col is not None and top is None:
+-            # цель пуста — переносим стопку в пустую колонку целиком
+-            self.try_move(self.selected_col, x)
+-        else:
+-            # клик мимо верхней карты — просто снимаем выбор/подсвечиваем
+-            self.selected_col = None
+-            self.hover_col = x
++                self.selected = None
++                self.update()
++            return
++        if ev.modifiers() & Qt.ShiftModifier:
++            # Shift+ЛКМ: выбрать ВЕСЬ столбец (перенести все его карты)
++            self.selected = (x, t)
++            self.drag_all_column = True
++            self.drag_from = None     # для всей колонки работает только клик-пара
++            self.update()
++            return
++        if prev is not None and prev[0] != x:
++            # второй клик по ДРУГОЙ колонке = ход «источник -> эта колонка».
++            # куда именно целимся (верх/низ стопки) не важно: движок всегда
++            # кладёт пачку сверху на целевую колонку.
++            self.try_move(prev[0], prev[1], x, self.selected_count())
++            return
++        # выбираем конкретную карту (если попали по занятой) — переносится
++        # она и ВСЁ под ней; куда именно целимся (верх/низ стопки) не важно:
++        # движок всегда кладёт пачку СВЕРХУ на целевую колонку.
++        sy = y if self.value_at(x, y) else t
++        if prev is not None and prev[0] == x:
++            # повторный клик по ТОЙ ЖЕ колонке-источнику НЕ должен случайно
++            # превратиться в ход «в себя» — только меняем/снимаем выбор
++            if prev == (x, sy):
++                self.selected = None
++                self.drag_from = None
++            else:
++                self.selected = (x, sy)
++                self.drag_all_column = False
++                self.drag_from = (x, sy)
++                self.drag_pos = QPointF(ev.pos())
++            self.update()
++            return
++        self.selected = (x, sy)
++        self.drag_all_column = False
++        self.drag_from = (x, sy)
++        self.drag_pos = QPointF(ev.pos())
+         self.update()
+ 
+     def mouseMoveEvent(self, ev):
+-        self.hover_col = self._col_at(ev.pos())
++        self.hover_col = self._col_at(QPointF(ev.pos().x(), PAD + 1))
++        if self.drag_from is not None and (ev.buttons() & Qt.LeftButton):
++            self.drag_pos = QPointF(ev.pos())
++        elif not (ev.buttons() & Qt.LeftButton):
++            self.drag_from = None
++        self.update()
++
++    def mouseReleaseEvent(self, ev):
++        if ev.button() != Qt.LeftButton:
++            return
++        start, frm = self.drag_pos, self.drag_from
++        self.drag_from = None
++        self.drag_pos = None
++        if frm is None or start is None:
++            self.update()
++            return
++        dx, dy = ev.pos().x() - start.x(), ev.pos().y() - start.y()
++        if abs(dx) < 12 and abs(dy) < 12:
++            self.update()             # обычный клик — уже обработан в pressEvent
++            return
++        # drag-and-drop: бросок выбранной пачки в другую колонку
++        tx = self._col_at(QPointF(ev.pos().x(), PAD + 1))
++        if tx is None or tx == frm[0]:
++            self.update()
++            return
++        cnt = self.column_height(frm[0]) if self.drag_all_column \
++            else self.selected_count()
++        self.try_move(frm[0], frm[1], tx, cnt)
++
++    def wheelEvent(self, ev):
++        """Ctrl+колесо — сдвиг выбранной карты вверх/вниз по стопке."""
++        if self.selected is None:
++            return
++        x, y = self.selected
++        t = self.top_index(x)
++        b = self.bottom_index(x)
++        if t is None:
++            self.selected = None
++            self.update()
++            return
++        dy = -1 if ev.angleDelta().y() > 0 else 1
++        ny = max(t, min(b, y + dy))
++        while ny != y and not self.value_at(x, ny):
++            ny += 1 if ny < y else -1
++        self.selected = (x, ny)
+         self.update()
+ 
+     def leaveEvent(self, ev):
+         self.hover_col = None
++        self.drag_from = None
+         self.update()
+ 
+     def keyPressEvent(self, ev):
+-        if ev.key() in (Qt.Key_Left, Qt.Key_Right):
+-            dx = -1 if ev.key() == Qt.Key_Left else 1
++        key = ev.key()
++        if key in (Qt.Key_Up, Qt.Key_Down) and self.selected:
++            # аналог Ctrl+колеса с клавиатуры
++            x, y = self.selected
++            t, b = self.top_index(x), self.bottom_index(x)
++            dy = -1 if key == Qt.Key_Up else 1
++            ny = max(t, min(b, y + dy))
++            self.selected = (x, ny)
++            self.update()
++            return
++        if key in (Qt.Key_Left, Qt.Key_Right):
++            dx = -1 if key == Qt.Key_Left else 1
+             cols = self.game.size[0]
+-            if self.selected_col is None:
++            if self.selected is None:
+                 cur = self.hover_col if self.hover_col is not None else 0
+                 for _ in range(cols):
+                     cur = (cur + dx) % cols
+-                    if self.column_stack(cur):
++                    if self.top_index(cur) is not None:
+                         break
+-                if self.column_stack(cur):
+-                    self.selected_col = cur
++                if self.top_index(cur) is not None:
++                    self.selected = (cur, self.top_index(cur))
+             else:
+-                self.try_move(self.selected_col, (self.selected_col + dx) % cols)
++                sx, sy = self.selected
++                self.try_move(sx, sy, (sx + dx) % cols, self.selected_count())
+             self.update()
+-        elif ev.key() == Qt.Key_Escape:
+-            self.selected_col = None
++        elif key == Qt.Key_Escape:
++            self.selected = None
+             self.update()
+ 
+     # --- отрисовка -----------------------------------------------------
+@@ -388,10 +564,13 @@ class BoardWidget(QWidget):
+         p.setBrush(QColor(255, 255, 255, 14))
+         p.drawRoundedRect(field_rect, 16, 16)
+ 
+-        # подсветки/селекторы колонок
++        sel_x = self.selected[0] if self.selected else None
++        sel_y = self.selected[1] if self.selected else None
++
++        # подсветки колонок
+         for x in range(self.game.size[0]):
+             r = self.col_rect(x).adjusted(2, 2, -2, -2)
+-            if x == self.selected_col:
++            if x == sel_x:
+                 p.setBrush(QColor(255, 210, 63, 36))
+                 p.drawRoundedRect(r, 14, 14)
+                 pen = QPen(QColor(255, 210, 63, 200))
+@@ -404,48 +583,68 @@ class BoardWidget(QWidget):
+                 p.setBrush(QColor(255, 255, 255, 18))
+                 p.drawRoundedRect(r, 14, 14)
+ 
+-        # danger: карты дошли до нижнего ряда (y = size[1]-1) — поле заполнено
++        # danger: карты дошли до нижнего ряда — поле заполнено
+         bottom_row = self.game.size[1] - 1
+         danger = any(self.game.field[x][bottom_row].value
+                      for x in range(self.game.size[0]))
+ 
+         # карты
+         for x in range(self.game.size[0]):
+-            stack = self.column_stack(x)
+-            n = len(stack)
+-            if not n:
++            t = self.top_index(x)
++            if t is None:
+                 continue
+-            y_first = self.top_index(x)          # y самой верхней карты
+-            for i, v in enumerate(stack):
+-                y = y_first + i                  # координата API == экранная строка
+-                center = self.cell_center(x, y)
++            b = self.bottom_index(x)
++            n = b - t + 1
++            for i, y in enumerate(range(t, b + 1)):
++                v = self.game.field[x][y].value
++                rect = self.cell_rect(x, y)
+                 slide_off = 0.0
+                 if self.row_slide > 0 and y == 0:
+-                    # новая строка «въезжает» сверху: рисуем её со смещением вверх
+                     slide_off = -self.row_slide * (CELL + GAP)
+-                rect = QRectF(center.x() - CELL / 2,
+-                              center.y() - CELL / 2 + slide_off,
+-                              CELL, CELL)
++                rect.translate(0, slide_off)
+                 scale = 1.0
+-                if x == self.selected_col:
++                if self.selected and x == sel_x and y >= sel_y:
+                     scale = 1.0 + 0.03 * (i + 1) / max(n, 1)
++                dimmed = bool(self.selected) and not (x == sel_x and y >= sel_y)
+                 self._draw_card(p, rect, v, scale=scale,
+-                                flash=self.merge_flash.get((x, y), 0))
++                                flash=self.merge_flash.get((x, y), 0),
++                                dim=dimmed,
++                                ring=(x == sel_x and y == sel_y))
+ 
+         if danger:
+             pen = QPen(QColor(239, 93, 93, 220))
+             pen.setWidth(3)
+             p.setPen(pen)
+             p.setBrush(Qt.NoBrush)
+-            # линия ПОД нижним рядом — зона переполнения
+             line_y = PAD + self.game.size[1] * (CELL + GAP) - GAP + 4
+             p.drawLine(int(PAD), int(line_y),
+                        int(self.board_px_w() - PAD), int(line_y))
+ 
++        # призрак перетаскиваемой пачки
++        if self.drag_from is not None and self.drag_pos is not None:
++            gx, gy = self.drag_pos.x(), self.drag_pos.y()
++            moved = False
++            g0 = self.cell_center(*self.drag_from)
++            if abs(gx - g0.x()) > 12 or abs(gy - g0.y()) > 12:
++                moved = True
++            if moved:
++                cnt = self.selected_count()
++                x, y = self.drag_from
++                vals = []
++                yy = y
++                while self.value_at(x, yy) and len(vals) < cnt:
++                    vals.append(self.value_at(x, yy))
++                    yy += 1
++                for i, v in enumerate(vals):
++                    rect = QRectF(gx - CELL / 2, gy - CELL / 2 + i * (CELL + GAP) * 0.35,
++                                  CELL, CELL)
++                    self._draw_card(p, rect, v, alpha=200)
++
+         p.end()
+ 
+     def _draw_card(self, p: QPainter, rect: QRectF, value: int,
+-                   scale: float = 1.0, flash: int = 0):
++                   scale: float = 1.0, flash: int = 0, dim: bool = False,
++                   ring: bool = False, alpha: int = 255):
+         base, text = level_color(value)
+         if base is None:
+             return
+@@ -458,15 +657,18 @@ class BoardWidget(QWidget):
+             r.moveCenter(QPointF(cx, cy))
+ 
+         c1 = QColor(base)
++        if dim:
++            c1 = c1.darker(170)
+         c2 = c1.darker(135)
+         lg = QLinearGradient(r.topLeft(), r.bottomRight())
+-        lg.setColorAt(0, c1.lighter(112))
+-        lg.setColorAt(1, c2)
++        a0 = int(alpha * 0.9)
++        lg.setColorAt(0, self._with_alpha(c1.lighter(112), a0))
++        lg.setColorAt(1, self._with_alpha(c2, a0))
+ 
+         # тень
+         p.setPen(Qt.NoPen)
+         shadow = QRectF(r).translated(0, 3)
+-        p.setBrush(QColor(0, 0, 0, 70))
++        p.setBrush(self._with_alpha(QColor(0, 0, 0), int(70 * alpha / 255)))
+         p.drawRoundedRect(shadow, 14, 14)
+ 
+         p.setBrush(lg)
+@@ -476,13 +678,13 @@ class BoardWidget(QWidget):
+         path = QPainterPath()
+         path.addRoundedRect(QRectF(r.x(), r.y(), r.width(), r.height() * 0.45), 14, 14)
+         gloss = QLinearGradient(r.topLeft(), QPointF(r.left(), r.center().y()))
+-        gloss.setColorAt(0, QColor(255, 255, 255, 55))
++        gloss.setColorAt(0, QColor(255, 255, 255, int(55 * alpha / 255)))
+         gloss.setColorAt(1, QColor(255, 255, 255, 0))
+         p.fillPath(path, gloss)
+ 
+         if flash:
+-            alpha = int(140 * (flash / 350.0))
+-            p.setBrush(QColor(255, 255, 255, alpha))
++            a = int(140 * (flash / 350.0))
++            p.setBrush(QColor(255, 255, 255, a))
+             p.drawRoundedRect(r, 14, 14)
+ 
+         label = card_label(value)
+@@ -492,16 +694,32 @@ class BoardWidget(QWidget):
+         if len(label) > 8:
+             f.setPointSize(9)
+         p.setFont(f)
+-        p.setPen(QColor(text))
++        tc = QColor(text)
++        tc.setAlpha(alpha)
++        p.setPen(tc)
+         p.drawText(r, Qt.AlignCenter, label)
+ 
+         # метка уровня
+         f2 = QFont("Consolas", 8)
+         p.setFont(f2)
+-        p.setPen(QColor(text).lighter(140) if QColor(text).value() < 160
+-                 else QColor(text).darker(140))
++        lc = QColor(text).lighter(140) if QColor(text).value() < 160 else QColor(text).darker(140)
++        lc.setAlpha(alpha)
++        p.setPen(lc)
+         p.drawText(r.adjusted(6, 2, -6, -2), Qt.AlignTop | Qt.AlignLeft, f"L{value}")
+ 
++        if ring:
++            pen = QPen(QColor("#ffd23f"), 3)
++            p.setPen(pen)
++            p.setBrush(Qt.NoBrush)
++            p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 14, 14)
++            p.setPen(Qt.NoPen)
++
++    @staticmethod
++    def _with_alpha(color: QColor, alpha: int) -> QColor:
++        c = QColor(color)
++        c.setAlpha(max(0, min(255, alpha)))
++        return c
++
+ 
+ # ---------------------------------------------------------------------------
+ # Главное окно
+@@ -513,6 +731,7 @@ class MainWindow(QMainWindow):
+         self.setWindowTitle("Merge Cards — PyQt5")
+         self.setStyleSheet("QMainWindow { background: #0b0e18; }")
+         self.game_over = False
++        self._undo_stack = []   # список сериализованных состояний игры
+ 
+         central = QWidget()
+         self.setCentralWidget(central)
+@@ -538,23 +757,22 @@ class MainWindow(QMainWindow):
+         root.addLayout(stats)
+ 
+         # ------- поле -------
+-        self.game = Game((BOARD_COLS, BOARD_ROWS), {})
+-        self.game.add_row()
++        self.game = self._fresh_game()
+         self.board = BoardWidget(self.game)
+         root.addWidget(self.board, 0, Qt.AlignHCenter)
+ 
+         # ------- статус -------
+-        self.lbl_status = QLabel("Выберите колонку, затем цель — карты сливаются пополам.")
++        self.lbl_status = QLabel()
+         self.lbl_status.setAlignment(Qt.AlignCenter)
+-        self.lbl_status.setStyleSheet("color:#9aa7c7; font: 13px 'Segoe UI'; padding:4px;")
+         root.addWidget(self.lbl_status)
+ 
+         # ------- кнопки -------
+         btns = QHBoxLayout()
+         btns.addStretch(1)
+         b_add = QPushButton("+ Строка")
++        b_undo = QPushButton("Отменить (Z)")
+         b_new = QPushButton("Новая игра")
+-        for b in (b_add, b_new):
++        for b in (b_add, b_undo, b_new):
+             b.setCursor(Qt.PointingHandCursor)
+             b.setMinimumWidth(130)
+             b.setStyleSheet(
+@@ -566,10 +784,13 @@ class MainWindow(QMainWindow):
+         btns.addStretch(1)
+         root.addLayout(btns)
+         b_add.clicked.connect(self.add_row_clicked)
++        b_undo.clicked.connect(self.undo_last)
+         b_new.clicked.connect(self.new_game)
+ 
+         self.refresh_stats()
+-        self.show_status("Удачи! Клик по колонке — выбор, клик по другой — перенос всей стопки.")
++        self.show_status("Клик по карте — выбрать (переносится она и всё под ней). "
++                         "Стрелки ←→ — перенести в соседнюю колонку, ↑↓ — выбрать карту "
++                         "ниже/выше в стопке. Space — новая строка, Z — отмена.")
+ 
+     # вспомогательное для блоков статистики
+     def _stat_box(self, layout: QHBoxLayout, name: str, accent: str) -> QLabel:
+@@ -589,6 +810,61 @@ class MainWindow(QMainWindow):
+         layout.addWidget(box)
+         return val
+ 
++    # ------- игра / undo -------
++    def _fresh_game(self) -> Game:
++        g = Game((BOARD_COLS, BOARD_ROWS), {})
++        g.add_row()
++        return g
++
++    def _serialize(self, g: Game):
++        return dict(
++            field=[[g.field[x][y].value for y in range(g.size_calc[1])]
++                   for x in range(g.size[0])],
++            points=g.points, bestCombo=g.bestCombo, bag=list(g._bag),
++            lastCombo=list(g.lastCombo),
++        )
++
++    def _deserialize(self, st) -> Game:
++        cards = {}
++        for x, col in enumerate(st["field"]):
++            for y, v in enumerate(col):
++                if v:
++                    cards.setdefault(x, {})[y] = Card((x, y), v)
++        g = Game((BOARD_COLS, BOARD_ROWS), cards)
++        g.points = st["points"]
++        g.bestCombo = st["bestCombo"]
++        g._bag = list(st["bag"])
++        g.lastCombo = list(st["lastCombo"])
++        return g
++
++    def clone_game(self, g: Game) -> Game:
++        """Независимый клон (Game.copy() делит _bag по ссылке — это баг API)."""
++        return self._deserialize(self._serialize(g))
++
++    def push_undo(self):
++        self._undo_stack.append(self._serialize(self.game))
++        if len(self._undo_stack) > 50:
++            self._undo_stack.pop(0)
++
++    def pop_undo_discard(self):
++        if self._undo_stack:
++            self._undo_stack.pop()
++
++    def undo_last(self, reason: str = ""):
++        if not self._undo_stack:
++            if reason:
++                self.show_status(reason, warn=True)
++            return
++        st = self._undo_stack.pop()
++        self.game = self._deserialize(st)
++        self.board.game = self.game
++        self.board.selected = None
++        self.board.merge_flash.clear()
++        self.game_over = False
++        self.refresh_stats()
++        self.show_status("Ход отменён." if not reason else reason)
++        self.board.update()
++
+     # ------- логика UI -------
+     def show_status(self, text: str, warn: bool = False):
+         color = "#f75f5f" if warn else "#9aa7c7"
+@@ -608,42 +884,52 @@ class MainWindow(QMainWindow):
+     def add_row_clicked(self):
+         if self.game_over:
+             return
+-        # Game.add_row() возвращает None при успехе и ("Game Over...", True) при провале.
+-        # При нехватке места движок может бросить исключение — ловим его и
+-        # корректно завершаем игру вместо падения приложения.
++        # Сначала проверим исход на КОПИИ — чтобы исключение движка
++        # (KeyError при переполнении) не уронило приложение после получившегося
++        # частичного изменения поля.
+         try:
+-            res = self.game.add_row()
++            probe = self.clone_game(self.game)
++            res = probe.add_row()
+         except Exception:
+-            self.on_game_over("поле переполнено")
++            self.on_game_over("поле переполнено — новую строку добавить некуда")
+             self.refresh_stats()
+             return
+         if isinstance(res, tuple) and str(res[0]).startswith("Game Over"):
+-            self.on_game_over(res[0])
+-        else:
+-            self.board.row_slide = 1.0
+-            self.board._start_anim()
+-            self.show_status("Добавлена новая строка сверху.")
++            self.on_game_over(str(res[0]))
++            return
++        self.push_undo()
++        try:
++            self.game.add_row()
++        except Exception:
++            self.undo_last(reason="Не удалось добавить строку.")
++            self.on_game_over("поле переполнено")
++            return
++        self.board.row_slide = 1.0
++        self.board._start_anim()
++        self.show_status("Добавлена новая строка сверху.")
+         self.refresh_stats()
+         self.check_deadlock()
+ 
+     def on_game_over(self, reason: str):
+         self.game_over = True
+-        self.show_status(f"Игра окончена ({reason}). Нажмите «Новая игра» или R.", warn=True)
++        self.show_status(f"Игра окончена ({reason}). «Отменить» (Z) вернёт последний ход, "
++                         "«Новая игра» или R — начнёт заново.", warn=True)
+ 
+     def check_deadlock(self):
+-        """Если ходов больше нет — корректно завершаем игру (без падения)."""
++        """Game Over только когда НЕТ ни одного принятого движком хода
++        И «+ Строка» тоже ведёт к заполнению поля."""
+         if self.game_over:
+             return
+-        if not self.board.has_legal_move():
+-            self.on_game_over("нет доступных ходов")
++        if not self.board.has_any_action():
++            self.on_game_over("не осталось ни ходов, ни места для новой строки")
+ 
+     def new_game(self):
+-        self.game = Game((BOARD_COLS, BOARD_ROWS), {})
+-        self.game.add_row()
++        self.game = self._fresh_game()
+         self.board.game = self.game
+-        self.board.selected_col = None
++        self.board.selected = None
+         self.board.merge_flash.clear()
+         self.board.setMinimumSize(self.board.board_px_w(), self.board.board_px_h())
++        self._undo_stack.clear()
+         self.game_over = False
+         self.refresh_stats()
+         self.show_status("Новая игра началась!")
+@@ -652,8 +938,10 @@ class MainWindow(QMainWindow):
+     def keyPressEvent(self, ev):
+         if ev.key() == Qt.Key_Space:
+             self.add_row_clicked()
+-        elif ev.key() in (Qt.Key_R,):
++        elif ev.key() == Qt.Key_R:
+             self.new_game()
++        elif ev.key() == Qt.Key_Z:
++            self.undo_last()
+         elif ev.key() == Qt.Key_Escape:
+             self.close()
+         else:
+diff --git a/mergeCards/__pycache__/API.cpython-312.pyc b/mergeCards/__pycache__/API.cpython-312.pyc
+index 3b58298943c58a0f00cc74922542669aa28b0b88..31adf35976e787946edddd5f2c4403d7c3461b83 100644
+GIT binary patch
+delta 27
+icmey~#@N)(xZw&5kBokKeo=ODL1J>M{^qMJi|hcI9SYI_
+
+delta 16
+XcmZo_XZ+sAxZw&5qu}NTEQ{;_I&%h^
+
+-- 
+2.39.5
+

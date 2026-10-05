@@ -1,4 +1,6 @@
-# Python compiled files
+# Compiled and build artifacts
 __pycache__/
-*.pyc__pycache__/
 *.pyc
+
+# Common compressed files
+*.tar.gz
