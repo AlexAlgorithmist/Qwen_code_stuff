@@ -117,219 +117,412 @@ def ease_inout(t: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Планировщик: журнал событий движка -> фазы анимации
+# Планировщик: журнал событий движка -> кадры анимации
 # ---------------------------------------------------------------------------
 
 class AnimScheduler:
-    """Превращает журнал событий движка в последовательность фаз анимации.
+    """Превращает ЖУРНАЛ событий движка в список кадров анимации.
 
-    События идут в порядке исполнения движком; для наглядности они
-    группируются в фазы:
-        fly    — полёт перенесённой серии (синтезируется из хода, т.к.
-                 движок перемещает карты прямым присваиванием без вызовов);
-        vanish — схлопывание пар; pop — рождение результата слияния;
-        slide  — перемещение существующей карты (каскад при добросе,
-                 compress после слияний);
-        spawn  — появление карт новой строки сверху.
+    Каждый кадр — ПОЛНОЕ состояние доски: словарь статичных карт плюс список
+    «движущихся» элементов. Карта физически не может исчезнуть и появиться
+    из ниоткуда: она либо стоит, либо летит между клетками (fly/slide),
+    либо гаснет/рождается (fade/pop/drop).
 
-    В конце фазы приводятся в согласованный вид со снимками before/after:
-    лишние события отбрасываются, недостающие (карты, которые движок
-    переставил «молча») добавляются как slide/spawn. Поэтому проигрывание
-    фаз клетка-в-клетку приводит состояние «до» к состоянию «после» —
-    анимация не может разъехаться с реальным полем.
+    Журнал пишется mergeCards/trainer.py, который перехватывает примитивы
+    движка и записывает события строго в порядке их исполнения:
+        transfer — сам перенос серии (движок делает его «молча»:
+                   frm=[клетки-источники], v=[значения], dst, dest_h —
+                   куда серия ляжет ДО слияний);
+        slide    — каскад при добросе строк или compress после слияний;
+        vanish+pop — пара схлопывающихся карт и рождение результата;
+        spawn    — карты новой(ых) строки(ок) сверху.
+
+    build() проигрывает журнал на копии поля и превращает его в сегменты
+    ('fly', 'growth', 'merge'), затем сверяет результат с финальным снимком
+    движка (reconcile): несошедшие сегменты отбрасываются, недостающие
+    изменения достраиваются. Поэтому анимация всегда доводит поле «до»
+    ровно до поля «после». frames() разворачивает сегменты в покадровый
+    список для плеера BoardWidget.
     """
 
-    FLY_MS = 430.0
-    VANISH_MS = 260.0
-    POP_MS = 260.0
-    SLIDE_MS = 320.0
-    SPAWN_MS = 400.0
-    STAGGER = 55.0          # задержка между картами одной фазы, мс
+    FLY_MS      = 360.0   # полёт серии (все карты летят разом, со стагом)
+    FLY_STAGGER = 55.0    # задержка между картами серии, мс
+    VANISH_MS   = 170.0   # схлопывание пары
+    POP_MS      = 230.0   # рождение результата слияния (со вспышкой)
+    SETTLE_MS   = 150.0   # оседание колонки после слияния
+    SLIDE_MS    = 240.0   # сдвиг каскада (строки едут одновременно)
+    SPAWN_MS    = 300.0   # въезд строки сверху
+    TICK        = 16      # мс на кадр
 
+    # ---------- построение сегментов из журнала ----------------------------
     @staticmethod
-    def build(events, before, after, src_x=None, dst_x=None, series=None):
-        S1 = BOARD_ROWS
-        phases = []
+    def _replay(events, before, cols, H):
+        sim = {(x, y): v for (x, y), v in before.items() if v}
+        segs = []
+        pend_vanish = None
+        open_growth = False
 
-        # 1) полёт серии — перед всеми событиями журнала
-        if src_x is not None and dst_x is not None and series:
-            lo, hi = series
-            dest_h = sum(1 for (x, y), v in before.items()
-                         if x == dst_x and v and y < S1)
-            flights = [{'kind': 'fly', 'frm': (src_x, y),
-                        'to': (dst_x, dest_h + i),
-                        'v': before.get((src_x, y), 0)}
-                       for i, y in enumerate(range(lo, hi + 1))
-                       if before.get((src_x, y), 0)]
-            if flights:
-                phases.append(['fly',
-                               AnimScheduler.FLY_MS
-                               + min(len(flights) * 70.0, 350.0),
-                               flights])
+        def growth():
+            nonlocal open_growth
+            if not (open_growth and segs and segs[-1]['t'] == 'growth'):
+                segs.append({'t': 'growth', 'items': []})
+            open_growth = True
+            return segs[-1]
 
-        # 2) события журнала, группируя одноимённые подряд идущие
         for ev in events:
             op = ev['op']
-            if op == 'slide':
-                kind, data = 'slide', {'kind': 'slide',
-                                       'frm': tuple(ev['frm']),
-                                       'to': tuple(ev['to']), 'v': ev['v']}
-            elif op == 'vanish':
-                kind, data = 'vanish', {'kind': 'vanish',
-                                        'at': tuple(ev['at']), 'v': ev['v']}
-            elif op == 'pop':
-                kind, data = 'pop', {'kind': 'pop',
-                                     'at': tuple(ev['at']), 'v': ev['v']}
+
+            if op == 'transfer':
+                moved = []
+                for i, (f, v) in enumerate(zip(ev['frm'], ev['v'])):
+                    t = (ev['dst'], ev['dest_h'] + i)
+                    moved.append((tuple(f), tuple(t), v))
+                if moved:
+                    # перенос записан ДО применения; сверяем с симуляцией:
+                    # источник должен стоять на своих местах, а клетки
+                    # назначения — быть свободны (движок кладёт серию встык)
+                    h_src = next((y for y in range(H)
+                                  if sim.get((moved[0][0][0], y))), None)
+                    col0 = moved[0][0][0]
+                    contig = sorted(y for (cx, y), vv in sim.items()
+                                    if cx == col0 and vv)
+                    series_ok = (contig[:len(moved)] ==
+                                 [m[0][1] for m in moved])
+                    free_ok = all(not sim.get(t) or sim.get(t) == v
+                                  for _f, t, v in moved)
+                    if (all(sim.get(f) == v for f, _t, v in moved)
+                            and series_ok and free_ok):
+                        for f, t, v in moved:
+                            sim[f] = 0
+                            sim[t] = v
+                        segs.append({'t': 'fly', 'moves': moved})
+                        open_growth = False
+
+            elif op == 'slide':
+                frm, to, v = tuple(ev['frm']), tuple(ev['to']), ev['v']
+                if sim.get(frm) != v:
+                    continue
+                sim[frm] = 0
+                sim[to] = v
+                g = growth()
+                g['items'].append(('slide', frm, to, v))
+                # если slide уходит из клетки, куда серия села только что,
+                # источник не надо вычитать из базового слоя — он и так пуст
+                if segs and segs[-1]['t'] == 'fly' \
+                        and any(t == frm for _f, t, _v in
+                                segs[-1]['moves']):
+                    g.setdefault('from_fly', set()).add(frm)
+
             elif op == 'spawn':
-                kind, data = 'spawn', {'kind': 'spawn',
-                                       'at': tuple(ev['at']), 'v': ev['v'],
-                                       'row': ev.get('row', 0)}
-            else:
-                continue
-            if phases and phases[-1][0] == kind:
-                phases[-1][2].append(data)
-            else:
-                phases.append([kind, 0.0, [data]])
+                at, v = tuple(ev['at']), ev['v']
+                sim[at] = v
+                g = growth()
+                g['items'].append(('spawn', at, v))
+                if segs and segs[-1]['t'] == 'fly' \
+                        and any(t == at for _f, t, _v in
+                                segs[-1]['moves']):
+                    g.setdefault('from_fly', set()).add(at)
 
-        AnimScheduler.reconcile(phases, before, after, S1)
+            elif op == 'vanish':
+                pend_vanish = ev
 
-        # 3) длительности и стаггеры внутри фаз
-        res = []
-        for kind, dur, evs in phases:
-            if kind == 'mixed':
-                # согласующая фаза: slide-части едут, spawn-части въезжают
-                slides = [e for e in evs if e['kind'] == 'slide']
-                spawns = [e for e in evs if e['kind'] == 'spawn']
-                for i, e in enumerate(slides):
-                    e['delay'] = round(i * 25.0)
-                for i, e in enumerate(spawns):
-                    e['delay'] = round(80 + i * 40.0)
-                dur = max(AnimScheduler.SLIDE_MS + len(slides) * 25.0,
-                          AnimScheduler.SPAWN_MS + len(spawns) * 40.0)
-                res.append(('mixed', dur, evs))
-                continue
-            if kind == 'fly':
-                evs.sort(key=lambda e: e['to'][1])
-                for i, e in enumerate(evs):
-                    e['delay'] = round(i * 60.0)
-            elif kind == 'slide':
-                evs.sort(key=lambda e: (-e['frm'][1], e['frm'][0]))
-                dur = AnimScheduler.SLIDE_MS + min(len(evs) * 18.0, 220.0)
-                rows = {}
-                for e in evs:
-                    e['delay'] = round(rows.get(e['frm'][1], 0) * 20.0)
-                    rows[e['frm'][1]] = rows.get(e['frm'][1], 0) + 1
-            elif kind == 'vanish':
-                evs.sort(key=lambda e: (e['at'][1], e['at'][0]))
-                dur = AnimScheduler.VANISH_MS + min(len(evs) * 50.0, 200.0)
-                for i, e in enumerate(evs):
-                    e['delay'] = round(i * AnimScheduler.STAGGER)
-            elif kind == 'pop':
-                evs.sort(key=lambda e: (e['at'][1], e['at'][0]))
-                dur = AnimScheduler.POP_MS + min(len(evs) * 70.0, 280.0)
-                for i, e in enumerate(evs):
-                    e['delay'] = round(i * AnimScheduler.STAGGER)
-            elif kind == 'spawn':
-                rowrank = {r: i for i, r in
-                           enumerate(sorted({e['row'] for e in evs}))}
-                cols = {}
-                for e in evs:
-                    e['delay'] = round(rowrank[e['row']] * 120.0
-                                       + cols.get(e['row'], 0) * 40.0)
-                    cols[e['row']] = cols.get(e['row'], 0) + 1
-                dur = (AnimScheduler.SPAWN_MS + max(rowrank.values()) * 120.0
-                       if rowrank else AnimScheduler.SPAWN_MS)
-            res.append((kind, dur, evs))
-        return res
+            elif op == 'pop':
+                if pend_vanish is None:
+                    continue
+                va, pa = tuple(pend_vanish['at']), tuple(ev['at'])
+                v_old, v_new = pend_vanish['v'], ev['v']
+                pend_vanish = None
+                if sim.get(va) != v_old or sim.get(pa) != v_new:
+                    continue
+                # При слипании всё, что было НИЖЕ vanishing-клетки, едет
+                # вверх ровно на одну клетку. Клетка pop'а (бывшая верхняя
+                # пары) остаётся на месте и НЕ двигается. Движок после
+                # каждого слияния делает полный каскад _compress — его
+                # slide/spawn из журнала поглощаются этим же сегментом
+                # ('absorb'), чтобы не превратиться в отдельный запоздалый
+                # каскад.
+                settle = []
+                for y in range(va[1] + 1, H):
+                    vv = sim.get((va[0], y))
+                    if vv and y != pa[1]:
+                        settle.append(((va[0], y), (va[0], y - 1), vv))
+                sim[va] = 0
+                sim[pa] = v_new
+                for f, t, v2 in settle:
+                    sim[f] = 0
+                    sim[t] = v2
+                open_growth = False
+                segs.append({'t': 'merge', 'vanish': (va, v_old),
+                             'pop': (pa, v_new), 'settle': settle,
+                             'absorb': True})
 
-    # --- согласование с before/after --------------------------------------
+        # после слияния движок трамбует колонку до конца (полный каскад
+        # _compress) — эти slide/spawn относятся к тому же моменту времени
+        for si, s in enumerate(segs):
+            if s['t'] == 'merge' and s.get('absorb'):
+                j = si + 1
+                while j < len(segs) and segs[j]['t'] == 'growth':
+                    s['settle'].extend(
+                        it[1:] for it in segs[j]['items'] if it[0] == 'slide')
+                    s['extra_spawn'] = [it[1:] for it in segs[j]['items']
+                                        if it[0] == 'spawn']
+                    j += 1
+                del segs[si + 1:j]
+        # упорядочиваем поглощённые сдвиги каскадом (низ -> вверх), чтобы
+        # применение было последовательным: y+1 -> y раньше, чем y+2 -> y+1
+        for s in segs:
+            if s['t'] == 'merge' and s.get('absorb'):
+                s['settle'].sort(key=lambda m: -m[0][1])
+        return segs
+
+    # ---------- длительности ----------------------------------------------
     @staticmethod
-    def _apply(field, kind, e, strict=False):
-        """Одно событие на словаре {(x,y): v}. Возвращает True если применимо."""
-        if kind == 'fly' or kind == 'slide':
-            frm, to, v = e['frm'], e['to'], e['v']
-            if field.get(frm) != v:
-                return not strict          # молча пропускаем чужое событие
-            del field[frm]
-            field[to] = v
+    def _dur(seg):
+        S = AnimScheduler
+        if seg['t'] == 'fly':
+            return S.FLY_MS + min(len(seg['moves']) * S.FLY_STAGGER, 250.0)
+        if seg['t'] == 'growth':
+            slides = [it for it in seg['items'] if it[0] == 'slide']
+            spawns = [it for it in seg['items'] if it[0] == 'spawn']
+            rows = sorted({it[3] for it in slides} |
+                          {it[1][1] for it in spawns})
+            base = S.SLIDE_MS if slides else S.SPAWN_MS
+            extra = max((S.SLIDE_MS * 0.35 * (r - rows[0])
+                         for r in rows[1:]), default=0.0)
+            return max(base + extra, S.SPAWN_MS)
+        if seg['t'] == 'merge':
+            depth = max([t[1] for _f, t, _v in seg['settle']] or [0])
+            return (S.VANISH_MS + S.POP_MS
+                    + (S.SETTLE_MS * (1.0 + 0.25 * depth)
+                       if seg['settle'] else 0.0))
+        return 200.0
+
+    # ---------- применение сегмента к полю ----------------------------------
+    @staticmethod
+    def _apply_seg(field, seg):
+        if seg['t'] == 'fly':
+            for f, t, v in seg['moves']:
+                field[f] = 0
+                field[t] = v
+        elif seg['t'] == 'growth':
+            for it in seg['items']:
+                if it[0] == 'slide':
+                    _k, f, t, v = it
+                    field[f] = 0
+                    field[t] = v
+                else:
+                    _k, at, v = it
+                    field[at] = v
+        elif seg['t'] == 'merge':
+            va, pa = seg['vanish'][0], seg['pop'][0]
+            field[va] = 0
+            field[pa] = seg['pop'][1]
+            for f, t, v in seg['settle']:
+                field[f] = 0
+                field[t] = v
+            for at, v in seg.get('extra_spawn', []):
+                field[at] = v
+
+    @staticmethod
+    def _seg_ok(field, seg):
+        """Сегмент применим к текущему состоянию истории?"""
+        if seg['t'] == 'fly':
+            return all(field.get(f) == v for f, _t, v in seg['moves']) \
+                and all(not field.get(t) for _f, t, _v in seg['moves'])
+        if seg['t'] == 'growth':
+            for it in seg['items']:
+                if it[0] == 'slide':
+                    if field.get(it[1]) != it[3]:
+                        return False
+                else:
+                    if field.get(it[1]):
+                        return False
             return True
-        if kind == 'vanish':
-            at, v = e['at'], e['v']
-            if field.get(at) != v:
-                return not strict
-            del field[at]
-            return True
-        if kind == 'pop':
-            field[e['at']] = e['v']
-            return True
-        if kind == 'spawn':
-            field[e['at']] = e['v']
+        if seg['t'] == 'merge':
+            va, vold = seg['vanish']
+            pa, vnew = seg['pop']
+            if field.get(va) != vold or field.get(pa) != vnew:
+                return False
+            snap = dict(field)
+            snap[va] = 0
+            snap[pa] = vnew
+            for f, t, v in seg['settle']:      # каскад применяется по порядку
+                if snap.get(f) != v:
+                    return False
+                snap[f] = 0
+                snap[t] = v
+            for at, v in seg.get('extra_spawn', []):
+                if snap.get(at):
+                    return False
             return True
         return False
 
+    # ---------- сборка фаз --------------------------------------------------
     @staticmethod
-    def reconcile(phases, before, after, S1):
+    def build(events, before, after, cols, rows, hidden_rows):
+        S1 = rows
         vis_after = {k: v for k, v in after.items() if v and k[1] < S1}
-        # a) выбрасываем события, которые уже не сходятся с ходом истории.
-        #    Особый случай: если перенесённая карта приземлилась точно на
-        #    клетку vanish — схлопывается именно она (её «призрак» летит и
-        #    гаснет в полёте), поэтому событие vanish для этой клетки убираем,
-        #        а pop показываем как рождение результата на месте посадки.
-        land = {}
-        for ph in phases:
-            if ph[0] == 'fly':
-                for e in ph[2]:
-                    land[e['to']] = e['v']
+        segs = AnimScheduler._replay(events, before, cols, hidden_rows)
+
+        # a) оставляем только сходящиеся сегменты
         field = {k: v for k, v in before.items() if v}
-        for ph in phases:
-            kept = []
-            for e in ph[2]:
-                f2 = dict(field)
-                ok = True
-                if ph[0] == 'vanish' and e['at'] in land \
-                        and land.get(e['at']) == e['v']:
-                    ok = False               # летящая карта сама слилась
-                elif not AnimScheduler._apply(f2, ph[0], e, strict=True):
-                    ok = False
-                if ok:
-                    field = f2
-                    kept.append(e)
-            ph[2] = kept
-        # b) недостающие перемещения/рождения: то, что есть в after, но
-        #    отсутствует в проигранной истории — добавляем отдельной фазой
+        kept = []
+        for s in segs:
+            if not AnimScheduler._seg_ok(field, s):
+                continue
+            AnimScheduler._apply_seg(field, s)
+            kept.append(s)
+
+        # b) недостающие изменения достраиваем одним growth-сегментом
         missing = {k: v for k, v in vis_after.items() if field.get(k) != v}
         extra = {k: v for k, v in field.items()
                  if v and k[1] < S1 and vis_after.get(k) != v}
-        add_evs = []
+        items = []
         used = set()
-        # сначала пытаемся объяснить недостающее сдвигом «лишней» карты
         for (ax, ay), av in sorted(extra.items()):
-            cand = [(y, k) for k, y in
-                    [((tx, ty), ty) for (tx, ty) in missing
-                     if tx == ax and ty > ay and missing[(tx, ty)] == av]
-                    if k not in used]
+            cand = [ty for (tx, ty) in list(missing)
+                    if tx == ax and ty > ay and missing[(tx, ty)] == av
+                    and (ax, ty) not in used]
             if cand:
-                ty = min(c[0] for c in cand)
-                mk = (ax, ty)
-                if mk in missing:
-                    add_evs.append({'kind': 'slide', 'frm': (ax, ay),
-                                    'to': mk, 'v': av})
-                    used.add(mk)
-                    del missing[mk]
-                    extra.pop((ax, ay))
+                ty = min(cand)
+                items.append(('slide', (ax, ay), (ax, ty), av))
+                used.add((ax, ty))
+                del missing[(ax, ty)]
+                del extra[(ax, ay)]
+                field[(ax, ay)] = 0
+                field[(ax, ty)] = av
         for (mx, my), mv in sorted(missing.items()):
-            add_evs.append({'kind': 'spawn', 'at': (mx, my), 'v': mv,
-                            'row': my})
-        if add_evs:
-            phases.append(['mixed', 0.0, add_evs])
-        # финальная проверка согласованности
+            items.append(('spawn', (mx, my), mv))
+            field[(mx, my)] = mv
+        for (ex, ey) in sorted(extra):
+            field[(ex, ey)] = 0     # лишнее молча уходит (за край и т.п.)
+        if items:
+            kept.append({'t': 'growth', 'items': items})
+
+        # c) финальная проверка согласованности всей истории
         field = {k: v for k, v in before.items() if v}
-        for ph in phases:
-            for e in ph[2]:
-                AnimScheduler._apply(field, ph[0], e)
-        ok = all(field.get(k) == v for k, v in vis_after.items()) \
-            and all(not field.get(k) for k in extra)
-        return ok
+        for s in kept:
+            AnimScheduler._apply_seg(field, s)
+        bad = ({k: v for k, v in field.items() if v} != vis_after)
+        if bad:                      # история не сходится — не анимируем
+            return []
+        for s in kept:
+            s['dur'] = AnimScheduler._dur(s)
+        return kept
+
+    # ---------- кадры --------------------------------------------------------
+    @staticmethod
+    def frames(phases, before, after, rows):
+        """Полный расчёт всех кадров заранее (детерминированный плеер)."""
+        S1, TICK = rows, AnimScheduler.TICK
+        S = AnimScheduler
+        frames = []
+        field = {k: v for k, v in before.items() if v}
+
+        def snap(excl):
+            return {k: v for k, v in field.items() if v and k[1] < S1
+                    and k not in excl}
+
+        for s in phases:
+            dur = max(s['dur'], 2 * TICK)
+            n = max(int(dur // TICK), 2)
+
+            if s['t'] == 'fly':
+                moves = s['moves']
+                excl = {m[0] for m in moves} | {m[1] for m in moves}
+                for i in range(n):
+                    u = (i + 1) / n
+                    anim, landed = [], {}
+                    for j, (f, t, v) in enumerate(moves):
+                        d = min(j * S.FLY_STAGGER / dur, 0.5)
+                        uu = max(0.0, min(1.0, (u - d) / max(1 - d, 1e-9)))
+                        if uu >= 1.0:
+                            landed[t] = v          # села — рисуем статично
+                        else:
+                            anim.append(('fly', f[0], f[1], t[0], t[1], v,
+                                         ease_inout(uu)))
+                    base = snap(excl)
+                    base.update(landed)
+                    frames.append({'base': base, 'anim': anim})
+                AnimScheduler._apply_seg(field, s)
+
+            elif s['t'] == 'growth':
+                slides = [(it[1], it[2], it[3]) for it in s['items']
+                          if it[0] == 'slide']
+                spawns = [(it[1], it[2]) for it in s['items']
+                          if it[0] == 'spawn']
+                from_fly = s.get('from_fly', set())
+                excl = ({f for f, _t, _v in slides if f not in from_fly}
+                        | {t for _f, t, _v in slides}
+                        | {a for a, _v in spawns})
+                for i in range(n):
+                    u = (i + 1) / n
+                    anim, landed = [], {}
+                    for (fx, fy), (tx, ty), v in slides:
+                        d = 0.35 * fy / max(S1 - 1, 1)
+                        uu = max(0.0, min(1.0, (u - d) / max(1 - d, 1e-9)))
+                        if uu >= 1.0:
+                            landed[(tx, ty)] = v
+                        else:
+                            anim.append(('slide', fx, fy, tx, ty, v,
+                                         ease_inout(uu)))
+                    for at, v in spawns:
+                        d = 0.30 * at[1] / max(S1 - 1, 1)
+                        uu = max(0.0, min(1.0, (u - d) / max(1 - d, 1e-9)))
+                        if uu >= 1.0:
+                            landed[at] = v
+                        else:
+                            anim.append(('drop', at[0], at[1], v,
+                                         ease_out(uu)))
+                    base = snap(excl)
+                    base.update(landed)
+                    frames.append({'base': base, 'anim': anim})
+                AnimScheduler._apply_seg(field, s)
+
+            elif s['t'] == 'merge':
+                (va, vold), (pa, vnew) = s['vanish'], s['pop']
+                settle = s['settle']
+                espawn = s.get('extra_spawn', [])
+                v_end = S.VANISH_MS / dur
+                p_end = (S.VANISH_MS + S.POP_MS) / dur
+                excl = ({va, pa} | {f for f, _t, _v in settle}
+                        | {t for _f, t, _v in settle}
+                        | {a for a, _v in espawn})
+                for i in range(n):
+                    u = (i + 1) / n
+                    anim, landed = [], {}
+                    vu = min(1.0, u / max(v_end, 1e-9))
+                    if vu < 1.0:
+                        anim.append(('fade', va[0], va[1], vold,
+                                     ease_inout(vu)))
+                    pu = max(0.0, min(1.0, (u - v_end) /
+                                      max(p_end - v_end, 1e-9)))
+                    if pu < 1.0:
+                        anim.append(('pop', pa[0], pa[1], vnew, pu))
+                    else:
+                        landed[pa] = vnew
+                    su = max(0.0, min(1.0, (u - p_end) /
+                                      max(1 - p_end, 1e-9)))
+                    for (fx, fy), (tx, ty), v in settle:
+                        if su >= 1.0:
+                            landed[(tx, ty)] = v
+                        else:
+                            anim.append(('slide', fx, fy, tx, ty, v,
+                                         ease_inout(su)))
+                    for at, v in espawn:
+                        if su >= 1.0:
+                            landed[at] = v
+                        else:
+                            anim.append(('drop', at[0], at[1], v,
+                                         ease_out(su)))
+                    base = snap(excl)
+                    base.update(landed)
+                    frames.append({'base': base, 'anim': anim})
+                AnimScheduler._apply_seg(field, s)
+
+        frames.append({'base': {k: v for k, v in after.items()
+                                if v and k[1] < S1}, 'anim': []})
+        return frames
 
 
 # ---------------------------------------------------------------------------
@@ -354,19 +547,11 @@ class BoardWidget(QWidget):
         self._press_moved = False
         self._drag_series = None
 
-        # плеер анимаций
+        # плеер анимаций: кадры рассчитываются ЗАРАНЕЕ по журналу движка,
+        # проигрываются строго по порядку — поле в кадре всегда полное
         self.anim_active = False
-        self._phases = []
-        self._pi = 0
-        self._pt = 0.0
-        self._base = {}
-        self._after = {}
-        self._carry = set()
-        self._flights = []
-        self._vanishing = []
-        self._popping = []
-        self._sliding = []
-        self._spawning = []
+        self._frames = []
+        self._fi = 0
         self._pending_gameover = None
 
         self._anim = QTimer(self)
@@ -524,7 +709,13 @@ class BoardWidget(QWidget):
 
     # --- выполнение хода ---------------------------------------------------
     def try_move(self, src_x, src_y, dst_x, count_rows=None):
-        """Перенос серии; возвращает True, если ход был совершён."""
+        """Перенос серии; возвращает True, если ход был совершён.
+
+        Ход исполняется ОДИН раз — на оригинале, но под EventRecorder:
+        журнал событий движка и есть сценарий анимации, поэтому экран не
+        может разъехаться с полем (никаких «пробных прогонов на копии»,
+        которые раньше давали два разных финала из-за randint в движке).
+        """
         win = self.window()
         if win is None or getattr(win, "game_over", False) or self.anim_active:
             return False
@@ -534,215 +725,99 @@ class BoardWidget(QWidget):
             self.selected = None
             self.update()
             return False
-        probe = self._try_move_probe(src_x, src_y, dst_x, count_rows)
-        if probe is None:
+        if not any(self.value_at(src_x, y)
+                   for y in range(src_y, min(src_y + count_rows,
+                                             self.game.size[1]))):
             self.selected = None
-            win.show_status("Движок отвергает такой перенос "
-                            "(источник пуст или позиция недопустима).",
-                            warn=True)
+            win.show_status("Источник пуст — нечего переносить.", warn=True)
             self.update()
             return False
-        res_probe, gc_probe, added_probe, evs_probe = probe
+
         before = self.snapshot(self.game)
-        series = (src_y, src_y + count_rows - 1)
-
-        if res_probe.startswith("Game Over"):
-            # Голый движок на таком ходе оставляет финальное поле и возвращает
-            # "Game Over..." — делаем ровно то же самое.
-            win.push_undo()
-            after = self.snapshot(gc_probe)
-            self.game = gc_probe
-            win.board_game_changed(self.game)
-            self.selected = None
-            self._play(before, after, evs_probe, src_x, dst_x, series,
-                       gameover_msg=res_probe)
-            win.refresh_stats()
-            return True
-
-        # Success на копии — применяем к оригиналу. Если движок НЕ добавлял
-        # строку, ход детерминирован и результат совпадает с голым движком;
-        # если добавил (там randint) — финалом берём проверенную копию,
-        # чтобы экран показывал ровно предсказанный исход (и журнал событий
-        # копии — тоже единственный честный).
         win.push_undo()
-        real_res, real_added, real_evs = self._engine_move(
-            self.game, src_x, src_y, dst_x, count_rows)
-        msg = None
-        if real_res != "Success":
-            after = self.snapshot(gc_probe)
-            self.game = gc_probe
-            win.board_game_changed(gc_probe)
-            msg = str(real_res)
-            evs = evs_probe
-        else:
-            added = bool(real_added) or bool(added_probe)
-            if added:
-                same = (self.snapshot(self.game) == self.snapshot(gc_probe)
-                        and self.game.points == gc_probe.points)
-                if not same:
-                    self.game = gc_probe
-                    win.board_game_changed(gc_probe)
-                    evs = evs_probe
-                else:
-                    evs = real_evs
-            else:
-                evs = real_evs
-            after = self.snapshot(self.game)
-
+        res, _added, evs = self._engine_move(self.game, src_x, src_y,
+                                             dst_x, count_rows)
+        after = self.snapshot(self.game)
         self.selected = None
-        combo = max(self.game.lastCombo) if self.game.lastCombo else 0
-        if msg is None:
-            win.show_status(f"Комбо x{combo}!" if combo > 1 else
-                            f"Перенесено карт: {count_rows}.")
+
+        msg = None
+        if res != "Success":
+            msg = str(res)          # «Game Over...» или «Invalid position»
+            win.show_status(f"Ход отвергнут движком: {msg}", warn=True)
+        else:
+            combo = max(self.game.lastCombo) if self.game.lastCombo else 0
+            win.show_status(f"Комбо x{combo}!" if combo > 1
+                            else f"Перенесено карт: {count_rows}.")
         win.refresh_stats()
-        self._play(before, after, evs, src_x, dst_x, series, gameover_msg=msg)
+        self._play(before, after, evs, gameover_msg=msg)
         if msg is None:
             win.check_deadlock()
         return True
 
     def do_add_row(self):
-        """«+ Строка»: прогон на независимой копии с захватом журнала,
-        затем анимация всего произошедшего (движок может добавить несколько
-        строк сразу — анимируются ВСЕ)."""
+        """«+ Строка»: тот же принцип — один честный прогон с журналом."""
         win = self.window()
         if win is None or getattr(win, "game_over", False) or self.anim_active:
             return
-        probe = self._clone()
+        before = self.snapshot(self.game)
+        win.push_undo()
         try:
-            with EventRecorder(probe) as rec:
-                res = probe.add_row()
+            with EventRecorder(self.game) as rec:
+                res = self.game.add_row()
             evs = list(rec.events)
         except Exception:
             res = "Game Over: engine exception"
             evs = []
-        bad = (isinstance(res, tuple) or
-               (res is not None and str(res).startswith("Game Over")))
-        before = self.snapshot(self.game)
-        after = self.snapshot(probe)
-        win.push_undo()
-        self.game = probe
-        win.board_game_changed(probe)
+        after = self.snapshot(self.game)
         self.selected = None
 
+        bad = (isinstance(res, tuple) or
+               (res is not None and str(res).startswith("Game Over")))
         msg = None
         if bad:
-            msg = str(res) if res is not None else "строка заполнила поле"
+            msg = str(res)
         else:
             win.show_status("Добавлена новая строка сверху.")
         win.refresh_stats()
-        self._play(before, after, evs, None, None, None, gameover_msg=msg)
+        self._play(before, after, evs, gameover_msg=msg)
         if not bad:
             win.check_deadlock()
 
     # --- плеер анимаций -----------------------------------------------------
-    def _play(self, before, after, events, src_x, dst_x, series,
-              gameover_msg=None):
-        """Собирает фазы из ЖУРНАЛА движка (согласованные с before/after)
-        и запускает плеер."""
+    def _play(self, before, after, events, gameover_msg=None):
+        """Кадры считаются ЗАРАНЕЕ по журналу движка и сверяются с before/
+        after. Если история не сходится клетка-в-клетку — показываем финал
+        мгновенно (честнее, чем рисовать неверную анимацию)."""
         phases = AnimScheduler.build(events, before, after,
-                                     src_x, dst_x, series)
-        self._phases = phases
-        self._pi = 0
-        self._pt = 0.0
-        self._base = {k: v for k, v in before.items() if v}
-        self._after = after
+                                     self.game.size[0], self.game.size[1],
+                                     self.game.size_calc[1])
+        frames = AnimScheduler.frames(phases, before, after,
+                                      self.game.size[1])
+        self._frames = frames
+        self._fi = 0
         self._pending_gameover = gameover_msg
-        self._reset_phase_state()
-        if not self._phases:          # анимировать нечего — мгновенно
+        # меньше двух кадров анимировать нечего
+        if len(self._frames) < 2:
             self._finish_anim()
             return
         self.anim_active = True
         if not self._anim.isActive():
             self._anim.start()
-        self._build_frame()
         self.update()
-
-    def _reset_phase_state(self):
-        self._carry = set()
-        self._flights = []
-        self._vanishing = []
-        self._popping = []
-        self._sliding = []
-        self._spawning = []
-
-    def _phase_carry(self, pi):
-        """Клетки, закрытые завершённой фазой (не рисуем базовым слоем)."""
-        kind, _dur, evs = self._phases[pi]
-        out = set()
-        for ev in evs:
-            k = ev['kind'] if kind == 'mixed' else kind
-            if k in ('fly', 'slide'):
-                out.add(ev['frm'])
-                out.add(ev['to'])
-            else:
-                out.add(ev['at'])
-        return out
-
-    def _build_frame(self):
-        """Собирает события текущего кадра из активной фазы."""
-        self._reset_phase_state()
-        if not (0 <= self._pi < len(self._phases)):
-            return
-        for pi in range(self._pi):
-            self._carry |= self._phase_carry(pi)
-        kind, dur, evs = self._phases[self._pi]
-        for ev in evs:
-            ekind = ev['kind'] if kind == 'mixed' else kind
-            delay = ev.get('delay', 0.0)
-            uu = (self._pt - delay) / max(dur - delay, 1.0)
-            if uu < 0.0:
-                if kind == 'fly':
-                    # ещё не стартовала: остаётся на СТАРОМ месте
-                    self._flights.append((ev['frm'], ev['frm'],
-                                          ev['v'] or self._base.get(ev['frm'], 0),
-                                          0.0))
-                    self._carry.add(ev['frm'])
-                continue
-            uu = min(1.0, uu)
-            if ekind == 'fly':
-                v = ev['v'] or self._base.get(ev['frm'], 0)
-                self._flights.append((ev['frm'], ev['to'], v, uu))
-                self._carry.add(ev['frm'])
-                if uu >= 1.0:
-                    self._carry.add(ev['to'])
-            elif ekind == 'vanish':
-                self._vanishing.append((ev['at'], ev['v'], uu))
-                if uu >= 1.0:
-                    self._carry.add(ev['at'])
-            elif ekind == 'pop':
-                self._popping.append((ev['at'], ev['v'], uu))
-                self._carry.add(ev['at'])
-            elif ekind == 'slide':
-                self._sliding.append((ev['frm'], ev['to'], ev['v'], uu))
-                self._carry.add(ev['frm'])
-                if uu >= 1.0:
-                    self._carry.add(ev['to'])
-            elif ekind == 'spawn':
-                self._spawning.append((ev['at'], ev['v'], uu))
-                self._carry.add(ev['at'])
 
     def _on_anim_tick(self):
         if not self.anim_active:
             return
-        self._pt += self.TICK_MS
-        while self._pi < len(self._phases) and \
-                self._pt >= self._phases[self._pi][1]:
-            self._carry |= self._phase_carry(self._pi)
-            self._pt -= self._phases[self._pi][1]
-            self._pi += 1
-        self._build_frame()
-        self.update()
-        if self._pi >= len(self._phases):
+        self._fi += 1
+        if self._fi >= len(self._frames):
             self._finish_anim()
+            return
+        self.update()
 
     def _finish_anim(self):
         self.anim_active = False
-        self._phases = []
-        self._pi = 0
-        self._pt = 0.0
-        self._reset_phase_state()
-        self._base = {}
-        self._after = {}
+        self._frames = []
+        self._fi = 0
         self._anim.stop()
         win = self.window()
         if self._pending_gameover is not None and win is not None:
@@ -1073,80 +1148,64 @@ class BoardWidget(QWidget):
                 p.setPen(Qt.NoPen)
 
     def _paint_animated(self, p: QPainter):
-        """Кадр анимированного перехода между _base и _after.
+        """Рисует заранее рассчитанный кадр: статичные карты + движение.
 
-        Базовым слоем рисуется состояние «до» за вычетом клеток, затронутых
-        фазами; поверх — активные события. Так кадры никогда не показывают
-        «гибрид» до/после в одном месте доски.
+        Кадры отдаёт AnimScheduler.frames(): 'base' — ВСЕ неподвижные карты
+        доски на этот момент, 'anim' — летящие/едущие/гаснущие/рождающиеся
+        карты. Ни одна карта не может пропасть: она либо в base, либо в anim.
         """
-        moving_frm = {f for f, _t, _v, _u in self._flights}
-        sliding_frm = {f for f, _t, _v, _u in self._sliding}
-        active_to = ({t for _f, t, _v, _u in self._flights if _u >= 1.0}
-                     | {t for _f, t, _v, _u in self._sliding if _u >= 1.0})
-        vanish_at = {a for a, _v, _u in self._vanishing}
-        pop_at = {a for a, _v, _u in self._popping}
-        spawn_at = {a for a, _v, _u in self._spawning}
-
-        # статичные карты состояния «до» (не затронутые анимацией)
-        for (x, y), v in self._base.items():
-            if not v or y < 0 or y >= self.game.size[1]:
-                continue
-            if (x, y) in (moving_frm | sliding_frm | self._carry):
-                continue
+        if not (0 <= self._fi < len(self._frames)):
+            return
+        fr = self._frames[self._fi]
+        for (x, y), v in fr['base'].items():
             self._draw_card(p, self.cell_rect(x, y), v)
 
-        # cascade/slide: карты едут между позициями
-        for frm, to, v, u in self._sliding:
-            e = ease_inout(u)
-            c1, c2 = self.cell_center(*frm), self.cell_center(*to)
-            cy = c1.y() + (c2.y() - c1.y()) * e
-            rect = QRectF(c1.x() - CELL / 2, cy - CELL / 2, CELL, CELL)
-            if rect.bottom() > PAD and rect.top() < self.board_px_h() - PAD:
-                self._draw_card(p, rect, v)
-
-        # схлопывающиеся карты
-        for at, v, u in self._vanishing:
-            e = ease_inout(u)
-            sc = 1.0 - 0.92 * e
-            al = int(255 * (1.0 - e))
-            if sc > 0.05 and al > 0:
-                self._draw_card(p, self.cell_rect(*at), v, scale=sc, alpha=al)
-
-        # полёты: летящая карта + силуэт на старом месте
-        for frm, to, v, u in self._flights:
-            e = ease_inout(u)
-            c1, c2 = self.cell_center(*frm), self.cell_center(*to)
-            arc = -min(abs(c2.x() - c1.x()), 140.0) * 0.35 * \
-                (4.0 * e * (1.0 - e)) if c2.x() != c1.x() else 0.0
-            cx = c1.x() + (c2.x() - c1.x()) * e
-            cy = c1.y() + (c2.y() - c1.y()) * e + arc
-            self._draw_card(p, QRectF(c1.x() - CELL / 2, c1.y() - CELL / 2,
-                                      CELL, CELL), v,
-                            alpha=int(60 * (1.0 - e)))
-            self._draw_card(p, QRectF(cx - CELL / 2, cy - CELL / 2,
-                                      CELL, CELL), v,
-                            scale=1.0 + 0.06 * (1.0 - abs(0.5 - e) * 2.0))
-
-        # pop результата слияний
-        for at, v, u in self._popping:
-            e = ease_out(u)
-            sc = 0.35 + 0.65 * e
-            if u < 0.55:
-                sc *= 1.0 + 0.18 * (u / 0.55)
-            self._draw_card(p, self.cell_rect(*at), v, scale=sc,
-                            flash=int(350 * (1.0 - e)))
-
-        # въезд новых карт/строк сверху (все добавленные движком строки)
-        for at, v, u in self._spawning:
-            e = ease_out(u)
-            x, y = at
-            cy_target = PAD + y * (CELL + GAP) + CELL / 2
-            start_y = -CELL / 2
-            cy = start_y + (cy_target - start_y) * e
-            rect = QRectF(PAD + x * (CELL + GAP), cy - CELL / 2, CELL, CELL)
-            if y >= self.game.size[1]:   # умершая за краем — гаснет
-                self._draw_card(p, rect, v, alpha=int(120 * (1.0 - e)))
-            else:
+        for item in fr['anim']:
+            kind = item[0]
+            if kind in ('fly', 'slide'):
+                _k, fx, fy, tx, ty, v, u = item
+                e = ease_inout(u)
+                c1, c2 = self.cell_center(fx, fy), self.cell_center(tx, ty)
+                if kind == 'fly':
+                    arc = -min(abs(c2.x() - c1.x()), 140.0) * 0.35 \
+                        * (4.0 * e * (1.0 - e))
+                    cx = c1.x() + (c2.x() - c1.x()) * e
+                    cy = c1.y() + (c2.y() - c1.y()) * e + arc
+                    self._draw_card(p, QRectF(cx - CELL / 2, cy - CELL / 2,
+                                              CELL, CELL), v,
+                                    scale=1.0 + 0.06 * (1.0 - abs(0.5 - e)
+                                                       * 2.0))
+                else:
+                    cy = c1.y() + (c2.y() - c1.y()) * e
+                    rect = QRectF(c1.x() - CELL / 2, cy - CELL / 2,
+                                  CELL, CELL)
+                    if rect.bottom() > PAD and \
+                            rect.top() < self.board_px_h() - PAD:
+                        self._draw_card(p, rect, v)
+            elif kind == 'fade':
+                _k, x, y, v, u = item
+                e = ease_inout(u)
+                sc = 1.0 - 0.92 * e
+                al = int(255 * (1.0 - e))
+                if sc > 0.05 and al > 0:
+                    self._draw_card(p, self.cell_rect(x, y), v,
+                                    scale=sc, alpha=al)
+            elif kind == 'pop':
+                _k, x, y, v, u = item
+                e = ease_out(u)
+                sc = 0.35 + 0.65 * e
+                if u < 0.55:
+                    sc *= 1.0 + 0.18 * (u / 0.55)
+                self._draw_card(p, self.cell_rect(x, y), v, scale=sc,
+                                flash=int(350 * (1.0 - e)))
+            elif kind == 'drop':
+                _k, x, y, v, u = item
+                e = ease_out(u)
+                cy_target = PAD + y * (CELL + GAP) + CELL / 2
+                start_y = -CELL / 2
+                cy = start_y + (cy_target - start_y) * e
+                rect = QRectF(PAD + x * (CELL + GAP), cy - CELL / 2,
+                              CELL, CELL)
                 self._draw_card(p, rect, v)
 
     def _draw_card(self, p: QPainter, rect: QRectF, value: int,
@@ -1415,7 +1474,8 @@ class MainWindow(QMainWindow):
         self.board.game = self.game
         self.board.selected = None
         self.board.anim_active = False
-        self.board._phases = []
+        self.board._frames = []
+        self.board._fi = 0
         self.board._anim.stop()
         self.board.setMinimumSize(self.board.board_px_w(),
                                   self.board.board_px_h())

@@ -115,6 +115,29 @@ class EventRecorder:
         orig = g.action_full
 
         def wrapped(posFrom, posTo, count=1):
+            # Перенос в движке — «молчаливое» присваивание; записываем его
+            # сами как fly-события, чтобы анимация показывала реальный
+            # перелёт серии (карты не исчезают и не появляются из ниоткуда).
+            if not isinstance(posFrom, tuple) or posFrom[0] == posTo \
+                    or posFrom[0] >= g.size[0] or posFrom[1] >= g.size[1]:
+                n_before = len(self.events)
+                res = orig(posFrom, posTo, count=count)
+                self._trim(n_before)
+                return res
+            col_from = [g.field[posFrom[0]][y].value
+                        for y in range(g.size_calc[1])]
+            series = []
+            for y in range(posFrom[1], self.S1):
+                if col_from[y] == 0:
+                    break
+                series.append((y, col_from[y]))
+            dest_h = 0
+            while dest_h < g.size_calc[1] and g.field[posTo][dest_h].value:
+                dest_h += 1
+            if series:
+                self.rec('transfer', frm=[(posFrom[0], y) for y, _v in series],
+                         v=[_v for _y, _v in series], dst=posTo,
+                         dest_h=dest_h)
             n_before = len(self.events)
             res = orig(posFrom, posTo, count=count)
             self._trim(n_before)
@@ -137,12 +160,17 @@ class EventRecorder:
         keep = []
         for ev in self.events[n_before:]:
             pts = []
-            if 'frm' in ev:
-                pts.append(ev['frm'])
-            if 'to' in ev:
-                pts.append(ev['to'])
-            if 'at' in ev:
-                pts.append(ev['at'])
+            if ev.get('op') == 'transfer':
+                pts.extend(ev['frm'])
+                pts.extend((ev['dst'], h + i)
+                           for i in range(len(ev['v'])))
+            else:
+                if 'frm' in ev:
+                    pts.append(ev['frm'])
+                if 'to' in ev:
+                    pts.append(ev['to'])
+                if 'at' in ev:
+                    pts.append(ev['at'])
             if any(y >= self.S1 for (_, y) in pts):
                 continue
             keep.append(ev)
